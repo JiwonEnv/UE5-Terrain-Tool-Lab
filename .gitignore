@@ -1,0 +1,65 @@
+# 저장소 루트가 곧 언리얼 프로젝트 폴더다.
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+.vsconfig
+
+# 엔진이 다시 만드는 프로젝트 파일
+*.sln
+*.slnx
+*.xcodeproj
+*.xcworkspace
+
+# 컴파일 결과물
+*.slo
+*.lo
+*.o
+*.obj
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.pdb
+*.mod
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+*.ipa
+
+# 언리얼이 자동으로 만드는 폴더
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+**/Plugins/**/Binaries/
+**/Plugins/**/Intermediate/
+
+# 패키징 결과물
+**/Build/*
+!**/Build/*/
+**/Build/*/**
+!**/Build/*/PakBlacklist*.txt
+!**/Build/**/*.ico
+
+# 맵 빌드 데이터
+*_BuiltData.uasset
+
+# SourceArt(원본 모델·텍스처·후가공 파일)는 레포에 올린다. 큰 파일은 .gitattributes의 LFS 규칙으로 관리.
+
+# 작업 스크린샷 (노션 카드·블로그용, 레포에는 안 올림)
+Captures/
+
+# 패키지 빌드 결과물 (RunUAT -archive 대상 · 배포용 zip)
+/Builds/
