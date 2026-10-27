@@ -55,7 +55,18 @@ private:
 	UPROPERTY(VisibleAnywhere) TObjectPtr<USceneComponent> Root;
 	UPROPERTY(Transient) TArray<TObjectPtr<UProceduralMeshComponent>> Chunks;
 	UPROPERTY(Transient) TObjectPtr<UProceduralMeshComponent> WaterMesh;
+	/** 기본 재질 (LandMaterial·WaterMaterial이 비었을 때 · 정점 색 재질) */
+	UPROPERTY(Transient) TObjectPtr<UMaterialInterface> DefaultMaterial;
+	/** 구역 한 변 칸 수 · 구역 개수 */
+	static constexpr int32 ChunkCells = 8;
+	int32 ChunksX = 0;
+	int32 ChunksY = 0;
 	void CreateGridIfNeeded();
+	/** 칸 수에 맞게 구역 메시 부품을 만들거나 지운다 */
+	void EnsureChunks();
+	void BuildChunk(int32 ChunkIndex);
+	void BuildWater();
+	UMaterialInterface* ResolveMaterial(UMaterialInterface* Preferred);
 	void RebuildAll();
 	void RebuildAround(const TArray<FIntPoint>& Changed);
 	FString SavePath() const;
