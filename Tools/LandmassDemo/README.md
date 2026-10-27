@@ -14,3 +14,10 @@
 python uepy.py code "STEP='hill'
 $(cat step.py)"
 ```
+
+## 같은 산 비교 (2026-10-27)
+
+- `cmp_lm.py` — Landmass로 산 30m · 계단식 터 3개(0 / 2.4 / 4.8m) · 연못 만들기(`build`) · 고치기(`edit`: 둘째 터 2칸 넓히기 · 산 5m 낮추기) · 나무·회색 상자 시설·주인공 막대 꾸미기(`dress`)
+- `cmp_cz.py` — 같은 설계를 CozyTerrainEditor 설계(`CozyTerrainLayout`)에 넣기(`setup`) · 적용은 편집기 창의 '지형에 적용' 버튼
+- `qcam.py` — 게임과 같은 쿼터뷰 카메라 (원근 화각 30° · 내려다보는 각 -45° · 방향 45° · 거리 85m)
+- 맵: `L_Compare_Landmass` · `L_Compare_CozyEditor` · 재질은 CozyRealm 본 게임 `Environment/Materials`·`Landscape` 사본

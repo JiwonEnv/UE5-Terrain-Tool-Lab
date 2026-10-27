@@ -37,3 +37,14 @@ def clear_brushes():
     for a in EAS().get_all_level_actors():
         n=a.get_class().get_name()
         if n.startswith('CustomBrush') or n.startswith('LandmassBrush_'): EAS().destroy_actor(a)
+def linear(a):
+    sp=spline(a)
+    for i in range(sp.get_number_of_spline_points()): sp.set_spline_point_type(i, unreal.SplinePointType.LINEAR, False)
+    sp.update_spline()
+def brush(label, pts, cap=True, angle=45.0, lin=False):
+    a=make(label, pts); a.set_editor_property('Cap Shape',cap); a.set_editor_property('Falloff Angle',float(angle))
+    if lin: linear(a)
+    register(a); return a
+def ground_z(x,y):
+    hit=unreal.SystemLibrary.line_trace_single(unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world(), unreal.Vector(x,y,20000), unreal.Vector(x,y,-20000), unreal.TraceTypeQuery.TRACE_TYPE_QUERY1, False, [], unreal.DrawDebugTrace.NONE, True)
+    t=hit.to_tuple(); return t[4].z if t[0] else None
