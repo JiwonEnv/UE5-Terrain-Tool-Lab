@@ -160,4 +160,176 @@ bool FCozyShapeDegenerateTest::RunTest(const FString&)
     TestFalse(TEXT("한 자리 점들은 무효"),One.IsValid());
     return true;
 }
+
+namespace CozyShapeRandomTestUtil
+{
+    // 중심 0,0 · 반지름 R · N각형
+    TArray<FCozyShapePoint> Ngon(int32 N,double R,bool bSharp)
+    {
+        TArray<FCozyShapePoint> Res;
+        for(int32 i=0;i<N;++i){ const double A=2.0*UE_DOUBLE_PI*i/N; FCozyShapePoint X; X.Position=FVector2D(FMath::Cos(A),FMath::Sin(A))*R; X.bSharp=bSharp; Res.Add(X); }
+        return Res;
+    }
+    // 울퉁불퉁한 부드러운 덩어리 (반지름 15~25m · 중심 30,-10)
+    TArray<FCozyShapePoint> Blob()
+    {
+        const double Rs[8]={20,25,17,22,24,15,21,19};
+        TArray<FCozyShapePoint> Res;
+        for(int32 i=0;i<8;++i){ const double A=2.0*UE_DOUBLE_PI*i/8; FCozyShapePoint X; X.Position=FVector2D(FMath::Cos(A),FMath::Sin(A))*Rs[i]+FVector2D(30,-10); Res.Add(X); }
+        return Res;
+    }
+    bool SamePoly(const FCozyPolyShape& A,const FCozyPolyShape& B)
+    {
+        if(A.Poly.Num()!=B.Poly.Num()||A.Span!=B.Span) return false;
+        for(int32 i=0;i<A.Poly.Num();++i) if(!A.Poly[i].Equals(B.Poly[i],1e-9)) return false;
+        return true;
+    }
+    // 띠가 바깥 모양 안 · 차례로 안쪽인지 (띠 꺾은선 꼭짓점 모두 검사)
+    bool Nested(const TArray<FCozyShapePoint>& Outline,const TArray<FCozyContourBand>& Bands)
+    {
+        FCozyPolyShape Prev; CozyTerrainShape::BuildPolyline(Outline,8,Prev);
+        for(const FCozyContourBand& B:Bands)
+        {
+            FCozyPolyShape S; CozyTerrainShape::BuildPolyline(B.Points,8,S);
+            if(!S.IsValid()) return false;
+            for(const FVector2D& V:S.Poly) if(!CozyTerrainShape::Contains(Prev,V)) return false;
+            Prev=MoveTemp(S);
+        }
+        return true;
+    }
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyShapeNoiseTest,"CozyRealm.TerrainEditor.Shape.Noise",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyShapeNoiseTest::RunTest(const FString&)
+{
+    using CozyTerrainShape::Noise2D;
+    bool bSame=true, bRange=true, bSmooth=true; double Lo=1e9, Hi=-1e9, Diff=0;
+    for(int32 y=0;y<40;++y) for(int32 x=0;x<40;++x)
+    {
+        const FVector2D P(x*3.7-70.0,y*2.9+1234.5);
+        const float V=Noise2D(P,15.f,7);
+        bSame&=V==Noise2D(P,15.f,7);
+        bRange&=V>=-1.2f&&V<=1.2f;
+        Lo=FMath::Min(Lo,double(V)); Hi=FMath::Max(Hi,double(V));
+        Diff+=FMath::Abs(double(V)-double(Noise2D(P,15.f,8)));
+        bSmooth&=FMath::Abs(double(V)-double(Noise2D(P+FVector2D(0.05,0.05),15.f,7)))<0.1;
+    }
+    TestTrue(TEXT("같은 씨앗 → 같은 값"),bSame);
+    TestTrue(TEXT("값이 -1.2~1.2 안"),bRange);
+    TestTrue(TEXT("값이 고르게 퍼짐 (최대-최소 > 0.8)"),Hi-Lo>0.8);
+    TestTrue(TEXT("씨앗이 다르면 값이 다름"),Diff/1600.0>0.05);
+    TestTrue(TEXT("가까운 점은 비슷한 값 (부드러움)"),bSmooth);
+    TestTrue(TEXT("크기 0도 터지지 않음"),FMath::IsFinite(Noise2D(FVector2D(1,2),0.f,1)));
+    TestTrue(TEXT("먼 좌표도 정상"),FMath::Abs(Noise2D(FVector2D(1e6,-3e6),10.f,3))<=1.2f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyShapeEdgeJitterTest,"CozyRealm.TerrainEditor.Shape.EdgeJitter",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyShapeEdgeJitterTest::RunTest(const FString&)
+{
+    using namespace CozyShapeRandomTestUtil;
+    const TArray<FCozyShapePoint> Gon=Ngon(48,20,true);
+    FCozyPolyShape Orig; CozyTerrainShape::BuildPolyline(Gon,8,Orig);
+
+    FCozyPolyShape Zero=Orig; CozyTerrainShape::ApplyEdgeJitter(Zero,0.f,12.f,1);
+    TestTrue(TEXT("세기 0 → 그대로"),SamePoly(Zero,Orig));
+    FCozyPolyShape Bad; CozyTerrainShape::BuildPolyline(Ngon(2,5,true),8,Bad); const int32 BadNum=Bad.Poly.Num();
+    CozyTerrainShape::ApplyEdgeJitter(Bad,3.f,12.f,1);
+    TestEqual(TEXT("무효 모양 → 그대로"),Bad.Poly.Num(),BadNum);
+
+    // 거의 0인 세기 = 다시 나누기만 한 것 (기준)
+    FCozyPolyShape Base=Orig; CozyTerrainShape::ApplyEdgeJitter(Base,1e-6f,12.f,1);
+    double MaxSeg=0; for(int32 i=0;i<Base.Poly.Num();++i) MaxSeg=FMath::Max(MaxSeg,FVector2D::Distance(Base.Poly[i],Base.Poly[(i+1)%Base.Poly.Num()]));
+    TestTrue(TEXT("다시 나눈 선분 길이 ≤ 크기/6"),MaxSeg<=12.0/6.0+0.01);
+    TestTrue(TEXT("점이 늘어남"),Base.Poly.Num()>Orig.Poly.Num());
+    bool bSpan=Base.Span.Num()==Base.Poly.Num(); for(int32 Sp:Base.Span) bSpan&=Sp>=0&&Sp<48;
+    TestTrue(TEXT("구간 번호 유지"),bSpan);
+
+    FCozyPolyShape J=Orig; CozyTerrainShape::ApplyEdgeJitter(J,3.f,12.f,1);
+    TestEqual(TEXT("꼭짓점 수 = 기준과 같음"),J.Poly.Num(),Base.Poly.Num());
+    bool bWithin=J.Poly.Num()==Base.Poly.Num(); double MaxMove=0;
+    TArray<double> Off;
+    for(int32 i=0;bWithin&&i<J.Poly.Num();++i)
+    {
+        const double Mv=FVector2D::Distance(J.Poly[i],Base.Poly[i]); MaxMove=FMath::Max(MaxMove,Mv);
+        const double Sd=CozyTerrainShape::SignedDistance(Orig,J.Poly[i]); // 바깥 +, 안 -
+        bWithin&=Mv<=3.0+1e-3&&FMath::Abs(Sd)<=3.0+1e-3;
+        Off.Add(Sd);
+    }
+    TestTrue(TEXT("움직인 거리 ≤ 세기"),bWithin);
+    TestTrue(TEXT("실제로 움직임"),MaxMove>0.3);
+    bool bOut=false, bIn=false; for(double O:Off){ bOut|=O>0.1; bIn|=O<-0.1; }
+    TestTrue(TEXT("바깥·안쪽 양쪽으로 움직임"),bOut&&bIn);
+    // 고리 이음새: 마지막 → 첫 점 변화가 다른 이웃들 변화보다 튀지 않음
+    double MaxInner=0; for(int32 i=0;i+1<Off.Num();++i) MaxInner=FMath::Max(MaxInner,FMath::Abs(Off[i+1]-Off[i]));
+    TestTrue(TEXT("끝과 처음이 부드럽게 이어짐"),Off.Num()>2&&FMath::Abs(Off[0]-Off.Last())<=2.0*MaxInner+0.01);
+
+    FCozyPolyShape J2=Orig; CozyTerrainShape::ApplyEdgeJitter(J2,3.f,12.f,1);
+    TestTrue(TEXT("같은 입력 → 같은 결과"),SamePoly(J,J2));
+    FCozyPolyShape J3=Orig; CozyTerrainShape::ApplyEdgeJitter(J3,3.f,12.f,2);
+    TestFalse(TEXT("씨앗이 다르면 다른 모양"),SamePoly(J,J3));
+
+    // 시계 방향 모양: 첫 꼭짓점(0도)은 같은 자리 · 둘레 0 → 같은 잡음값 → 바깥/안 방향이 같아야 함
+    TArray<FCozyShapePoint> Rev; Rev.Add(Gon[0]); for(int32 i=Gon.Num()-1;i>0;--i) Rev.Add(Gon[i]);
+    FCozyPolyShape RO; CozyTerrainShape::BuildPolyline(Rev,8,RO);
+    FCozyPolyShape RJ=RO; CozyTerrainShape::ApplyEdgeJitter(RJ,3.f,12.f,1);
+    const double RevOff0=RJ.Poly.Num()>0?double(CozyTerrainShape::SignedDistance(RO,RJ.Poly[0])):0.0;
+    TestTrue(TEXT("방향과 상관없이 바깥 방향 일정"),Off.Num()>0&&(FMath::Abs(Off[0])<0.05||FMath::Abs(RevOff0-Off[0])<1e-3));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyShapeBandsTest,"CozyRealm.TerrainEditor.Shape.Bands",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyShapeBandsTest::RunTest(const FString&)
+{
+    using namespace CozyShapeRandomTestUtil;
+    const TArray<FCozyShapePoint> Outline=Blob();
+    TArray<FCozyContourBand> B; CozyTerrainShape::GenerateBands(Outline,3,30.f,5,B);
+    TestEqual(TEXT("띠 3개"),B.Num(),3);
+    if(B.Num()==3)
+    {
+        TestEqual(TEXT("높이 7.5"),B[0].Height,7.5f);
+        TestEqual(TEXT("높이 15"),B[1].Height,15.f);
+        TestEqual(TEXT("높이 22.5"),B[2].Height,22.5f);
+    }
+    bool bSmooth=true; for(const FCozyContourBand& X:B){ bSmooth&=X.Points.Num()>=3; for(const FCozyShapePoint& P:X.Points) bSmooth&=!P.bSharp; }
+    TestTrue(TEXT("띠 점은 부드러운 점"),bSmooth);
+    TestTrue(TEXT("띠가 바깥 모양 안 · 차례로 안쪽"),Nested(Outline,B));
+
+    TArray<FCozyContourBand> B2; CozyTerrainShape::GenerateBands(Outline,3,30.f,5,B2);
+    bool bSame=B.Num()==B2.Num();
+    for(int32 k=0;bSame&&k<B.Num();++k){ bSame&=B[k].Points.Num()==B2[k].Points.Num(); for(int32 i=0;bSame&&i<B[k].Points.Num();++i) bSame&=B[k].Points[i].Position==B2[k].Points[i].Position; }
+    TestTrue(TEXT("같은 씨앗 → 같은 띠"),bSame);
+
+    // 씨앗을 바꾸면 꼭대기(가장 안쪽 띠의 중심)가 옮겨 감
+    auto Peak=[](const TArray<FCozyContourBand>& Bs){ TArray<FVector2D> Ps; if(Bs.Num()>0) for(const FCozyShapePoint& P:Bs.Last().Points) Ps.Add(P.Position); return CozyTerrainShape::Centroid(Ps); };
+    const FVector2D P0=Peak(B); bool bMoved=false, bAllNested=true;
+    for(int32 Seed=6;Seed<12;++Seed)
+    {
+        TArray<FCozyContourBand> Bs; CozyTerrainShape::GenerateBands(Outline,3,30.f,Seed,Bs);
+        bAllNested&=Bs.Num()==3&&Nested(Outline,Bs);
+        bMoved|=FVector2D::Distance(Peak(Bs),P0)>1.0;
+    }
+    TestTrue(TEXT("씨앗마다 차례로 안쪽"),bAllNested);
+    TestTrue(TEXT("씨앗을 바꾸면 꼭대기가 옮겨 감"),bMoved);
+
+    // 개수 범위 · 오목한 ㄱ자
+    TArray<FCozyContourBand> Many; CozyTerrainShape::GenerateBands(Outline,20,90.f,1,Many);
+    TestEqual(TEXT("띠 최대 8개"),Many.Num(),8);
+    TestTrue(TEXT("8개도 차례로 안쪽"),Nested(Outline,Many));
+    if(Many.Num()==8) TestEqual(TEXT("8개 맨 안쪽 높이 80"),Many.Last().Height,80.f);
+    TArray<FCozyContourBand> Few; CozyTerrainShape::GenerateBands(Outline,0,10.f,1,Few);
+    TestEqual(TEXT("띠 최소 1개"),Few.Num(),1);
+    TArray<FCozyShapePoint> L;
+    for(const FVector2D& P:{FVector2D(0,0),FVector2D(40,0),FVector2D(40,16),FVector2D(16,16),FVector2D(16,40),FVector2D(0,40)}){ FCozyShapePoint X; X.Position=P; X.bSharp=true; L.Add(X); }
+    TArray<FCozyContourBand> LB; CozyTerrainShape::GenerateBands(L,3,30.f,3,LB);
+    TestTrue(TEXT("ㄱ자 모양도 차례로 안쪽"),LB.Num()==3&&Nested(L,LB));
+
+    // 점이 모자라거나 한 자리 → 비어 있음
+    TArray<FCozyContourBand> E; CozyTerrainShape::GenerateBands(Ngon(2,10,false),3,30.f,1,E);
+    TestEqual(TEXT("점 2개 → 띠 없음"),E.Num(),0);
+    TArray<FCozyShapePoint> Same; for(int32 i=0;i<4;++i){ FCozyShapePoint X; X.Position=FVector2D(3,3); Same.Add(X); }
+    CozyTerrainShape::GenerateBands(Same,3,30.f,1,E);
+    TestEqual(TEXT("한 자리 점 → 띠 없음"),E.Num(),0);
+    return true;
+}
 #endif

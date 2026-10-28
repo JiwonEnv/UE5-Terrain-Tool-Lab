@@ -43,6 +43,18 @@ static FVector2D ToWorld(const FCozyLandform& F,FVector2D V){return F.Center+V.G
 static FCozyPolyShape FreePoly(const FCozyLandform& F){FCozyPolyShape S;if(F.Points.Num()>=3){CozyTerrainShape::BuildPolyline(F.Points,12,S);CozyTerrainShape::Prepare(S);}return S;}
 // 자유 모양의 가로·세로는 점들을 감싼 크기 (표시용)
 static void FitFreeSize(FCozyLandform& F){if(!IsFree(F)||F.Points.IsEmpty())return;FBox2D B(ForceInit);for(const auto& S:F.Points)B+=S.Position;const FVector2D E=B.GetSize();F.Size=FVector2D(FMath::Clamp(R1(E.X),2.,2000.),FMath::Clamp(R1(E.Y),2.,2000.));}
+// 안쪽 띠는 자유 모양 산에만
+static bool HasBands(const FCozyLandform& F){return IsFree(F)&&F.Type==ECozyLandform::Mountain;}
+// 지도에 그리는 선: 테두리 들쭉날쭉까지 넣어 지형 계산과 같게 (씨앗: 바깥 모양 +0 · 띠 i는 +i+1) · Band가 없으면 바깥 모양
+// 선택 판정(HitLandform)은 들쭉날쭉 없는 FreePoly로 · 선 가까이 누르기·점 끼워 넣기는 보이는 선(이것)으로
+static FCozyPolyShape LinePoly(const FCozyLandform& F,int Band)
+{
+    const bool bBand=F.Bands.IsValidIndex(Band);const TArray<FCozyShapePoint>& Pts=bBand?F.Bands[Band].Points:F.Points;FCozyPolyShape S;
+    if(Pts.Num()>=3){CozyTerrainShape::BuildPolyline(Pts,12,S);CozyTerrainShape::ApplyEdgeJitter(S,F.EdgeJitter,F.EdgeJitterSize,F.RandomSeed+(bBand?Band+1:0));}
+    return S;
+}
+// 높이 글자: 정수면 "10m", 아니면 "12.5m"
+static FString MetersText(float V){return FMath::IsNearlyEqual(V,FMath::RoundToFloat(V),.05f)?FString::Printf(TEXT("%.0fm"),V):FString::Printf(TEXT("%.1fm"),V);}
 class SPanel;
 class SMap : public SLeafWidget
 {
@@ -69,10 +81,16 @@ public:
     TArray<FVector2D> DrawPts;FVector2D HoverPixel=FVector2D::ZeroVector;bool bHover=false;
     // 자유 모양 점 끌기 · 통째로 옮길 때 누른 곳과 중심의 차이
     bool bPointDrag=false;FVector2D DragOffset=FVector2D::ZeroVector;
-    /** 지도 픽셀 위치에 있는 자유 모양 점 번호 (없으면 INDEX_NONE) */
-    int HitPoint(const FVector2D& Size,const ACozyTerrainLayout& P,const FCozyLandform& F,FVector2D Mouse) const;
+    /** 지도 픽셀 위치에 있는 점 번호 (Pts = 바깥 모양 또는 띠의 점 · 없으면 INDEX_NONE) */
+    int HitPoint(const FVector2D& Size,const ACozyTerrainLayout& P,const FCozyLandform& F,const TArray<FCozyShapePoint>& Pts,FVector2D Mouse) const;
+    /** 자유 모양 산의 띠 선(8픽셀 안)이나 띠 점을 눌렀는지 · 눌렀으면 띠 번호와 점 번호(없으면 INDEX_NONE) */
+    bool HitBand(const FVector2D& Size,const ACozyTerrainLayout& P,const FCozyLandform& F,FVector2D Mouse,int& OutBand,int& OutPoint) const;
     /** 찍은 점으로 자유 모양을 만든다 (3개 이상) */
     void FinishFree(SPanel& O,ACozyTerrainLayout& P);
+    /** 찍은 점으로 고른 산에 안쪽 띠를 만든다 (3개 이상) */
+    void FinishBand(SPanel& O,ACozyTerrainLayout& P);
+    /** 그리기 도구(4 자유 모양 · 5 띠)에 맞게 닫기 */
+    void FinishDraw(SPanel& O,ACozyTerrainLayout& P);
 };
 
 class SPanel : public SCompoundWidget
@@ -86,8 +104,17 @@ public:
     // 오른쪽 요소 목록 (0 이상 = 평지·산 번호 · 음수 = -1-길 번호)
     TArray<TSharedPtr<int32>> Items;
     TSharedPtr<SListView<TSharedPtr<int32>>> List;
-    // Mode: 0 선택 · 1 평지 · 2 산 · 3 길 · 4 자유 모양 · Point = 선택한 자유 모양의 점
-    int Mode=0,Selected=INDEX_NONE,Route=INDEX_NONE,Node=INDEX_NONE,Point=INDEX_NONE;
+    // Mode: 0 선택 · 1 평지 · 2 산 · 3 길 · 4 자유 모양 · 5 안쪽 띠 그리기 · Point = 선택한 자유 모양(또는 띠)의 점 · Band = 고른 안쪽 띠 (없으면 바깥 모양)
+    int Mode=0,Selected=INDEX_NONE,Route=INDEX_NONE,Node=INDEX_NONE,Point=INDEX_NONE,Band=INDEX_NONE;
+    // '띠 자동 만들기'로 만들 띠 수
+    int BandCount=3;
+    bool IsDrawing() const{return Mode==4||Mode==5;}
+    /** 고른 띠 번호 (자유 모양 산이고 번호가 맞을 때만 · 아니면 INDEX_NONE) */
+    int BandOf(const FCozyLandform& F) const{return HasBands(F)&&F.Bands.IsValidIndex(Band)?Band:INDEX_NONE;}
+    const FCozyContourBand* SelBand() const{const FCozyLandform* F=Sel();const int B=F?BandOf(*F):INDEX_NONE;return B!=INDEX_NONE?&F->Bands[B]:nullptr;}
+    /** 점 편집 대상: 고른 띠가 있으면 그 띠, 없으면 바깥 모양 */
+    const TArray<FCozyShapePoint>& EditPoints(const FCozyLandform& F) const{const int B=BandOf(F);return B!=INDEX_NONE?F.Bands[B].Points:F.Points;}
+    TArray<FCozyShapePoint>& EditPoints(FCozyLandform& F) const{const int B=BandOf(F);return B!=INDEX_NONE?F.Bands[B].Points:F.Points;}
     bool bContours=true,bSlope=true;
     // 바로 반영: 마지막 변경 0.35초 뒤 (끄는 중이면 0.35초마다) 지형에 반영
     double LiveDue=0,LastLive=0;FString LiveNote;
@@ -139,16 +166,42 @@ public:
     }
     void DeleteSelected()
     {
-        // 자유 모양의 점을 골랐으면 그 점만 지움 (3개 아래로는 안 됨)
-        if(const FCozyLandform* F=Sel())if(IsFree(*F)&&F->Points.IsValidIndex(Point))
+        // 자유 모양(또는 고른 띠)의 점을 골랐으면 그 점만 지움 (3개 아래로는 안 됨)
+        if(const FCozyLandform* F=Sel())if(IsFree(*F)&&EditPoints(*F).IsValidIndex(Point))
         {
-            if(F->Points.Num()<=3){Message(TEXT("점은 3개 이상이어야 합니다"));return;}
-            Mutate([this](ACozyTerrainLayout& P){auto& L=P.Recipe.Landforms[Selected];L.Points.RemoveAt(Point);FitFreeSize(L);Point=INDEX_NONE;});
-            Message(TEXT("점을 지웠습니다. 요소 전체를 지우려면 모양 안쪽을 눌러 고른 뒤 Delete."));return;
+            if(EditPoints(*F).Num()<=3){Message(TEXT("점은 3개 이상이어야 합니다"));return;}
+            const bool bBand=BandOf(*F)!=INDEX_NONE;
+            Mutate([this](ACozyTerrainLayout& P){auto& L=P.Recipe.Landforms[Selected];EditPoints(L).RemoveAt(Point);FitFreeSize(L);Point=INDEX_NONE;});
+            Message(bBand?TEXT("띠의 점을 지웠습니다. 띠 전체를 지우려면 점을 고르지 않은 채 Delete (또는 '띠 지우기')."):TEXT("점을 지웠습니다. 요소 전체를 지우려면 모양 안쪽을 눌러 고른 뒤 Delete."));return;
         }
+        // 띠를 골랐으면 (점 없이) 그 띠만 지움 · 산은 그대로
+        if(SelBand()){DeleteBand();return;}
         Mutate([this](auto& P){if(P.Recipe.Landforms.IsValidIndex(Selected))P.Recipe.Landforms.RemoveAt(Selected);else if(P.Recipe.Routes.IsValidIndex(Route)){if(P.Recipe.Routes[Route].Points.IsValidIndex(Node))P.Recipe.Routes[Route].Points.RemoveAt(Node);else P.Recipe.Routes.RemoveAt(Route);}SelectNone();});
     }
+    void DeleteBand()
+    {
+        if(!SelBand())return;
+        Mutate([this](ACozyTerrainLayout& P){auto& L=P.Recipe.Landforms[Selected];if(L.Bands.IsValidIndex(Band))L.Bands.RemoveAt(Band);Band=Point=INDEX_NONE;});
+        Message(TEXT("띠를 지웠습니다 (산은 그대로 · 되돌리기로 복구)."));
+    }
+    /** 고른 자유 모양 산에 띠를 그리기 시작 */
+    void StartBandDraw()
+    {
+        const FCozyLandform* F=Sel();if(!F||!HasBands(*F)){Message(TEXT("먼저 자유 모양 산을 고르세요."));return;}
+        Mode=5;Band=Point=INDEX_NONE;if(Map)Map->DrawPts.Reset();
+        Message(TEXT("띠 그리기 · 산 안쪽에 점을 차례로 클릭하세요. 첫 점을 다시 누르거나 Enter·더블클릭으로 닫습니다 (3개 이상) · Backspace 마지막 점 지우기 · Esc 취소."));
+    }
+    /** 바깥 모양 안에 띠를 자동으로 (있던 띠는 바꿈 · 되돌리기로 복구) */
+    void AutoBands()
+    {
+        const FCozyLandform* F=Sel();if(!F||!HasBands(*F)||F->Points.Num()<3){Message(TEXT("먼저 자유 모양 산을 고르세요."));return;}
+        const bool bHad=F->Bands.Num()>0;const int Count=FMath::Clamp(BandCount,1,8);
+        Mutate([this,Count](ACozyTerrainLayout& P){auto& L=P.Recipe.Landforms[Selected];CozyTerrainShape::GenerateBands(L.Points,Count,L.Height,L.RandomSeed,L.Bands);Band=Point=INDEX_NONE;});
+        if(const FCozyLandform* G=Sel())Message(FString::Printf(TEXT("안쪽 띠 %d개를 만들었습니다%s. 띠 선을 눌러 고르면 점·높이를 고칠 수 있습니다."),G->Bands.Num(),bHad?TEXT(" (있던 띠는 바뀜 · 되돌리기로 복구)"):TEXT("")));
+    }
     void Message(FString S){Status=MoveTemp(S);Refresh();}
+    /** 고른 평지·산 하나를 고침 (되돌리기·바로 반영 포함) */
+    void EditSel(TFunction<void(FCozyLandform&)> Fn){Mutate([this,Fn](ACozyTerrainLayout& P){if(P.Recipe.Landforms.IsValidIndex(Selected))Fn(P.Recipe.Landforms[Selected]);});}
     void Mutate(TFunction<void(ACozyTerrainLayout&)> Fn)
     {
         if(auto* P=GetPlan()) {const FScopedTransaction Tx(T(TEXT("지형 설계 편집")));P->Modify();Fn(*P);SnapSelected(*P);P->bHasUnappliedChanges=true;P->bShowPreview=true;P->MarkPackageDirty();Refresh();ScheduleLive();}
@@ -187,7 +240,7 @@ public:
         +SHorizontalBox::Slot().FillWidth(.7f).Padding(2)[Opt(A,0)]
         +SHorizontalBox::Slot().FillWidth(.7f).Padding(2)[Opt(B,1)];
     }
-    void SelectNone(){Selected=Route=Node=Point=INDEX_NONE;}
+    void SelectNone(){Selected=Route=Node=Point=Band=INDEX_NONE;}
     void FitView()
     {
         auto* P=GetPlan();
@@ -248,7 +301,7 @@ public:
                 TEXT("지도에 점을 차례로 클릭하세요. 첫 점을 다시 누르거나 Enter·더블클릭으로 닫습니다 (3개 이상) · Backspace 마지막 점 지우기 · Esc 취소.")};
             // 지금 켜진 도구는 파랗게
             return SNew(SButton).Text(T(Label)).ButtonColorAndOpacity_Lambda([this,M](){return Mode==M?FLinearColor(.25,.65,1):FLinearColor::White;})
-                .OnClicked_Lambda([this,M](){Mode=M;if(Map)Map->DrawPts.Reset();if(M==3||M==4){Route=Node=Point=INDEX_NONE;Selected=INDEX_NONE;}Message(Help[M]);return FReply::Handled();});
+                .OnClicked_Lambda([this,M](){Mode=M;if(Map)Map->DrawPts.Reset();if(M==3||M==4)SelectNone();Message(Help[M]);return FReply::Handled();});
         };
         ChildSlot[SNew(SVerticalBox)
         +SVerticalBox::Slot().AutoHeight().Padding(8)[SNew(STextBlock).Text(T(TEXT("지형 편집기  ·  현재 레벨의 평지·산·길 설계"))).Font(FAppStyle::GetFontStyle("HeadingExtraSmall"))]
@@ -284,7 +337,7 @@ public:
                 // 바로 반영: 값을 바꾸고 잠시 뒤 지형에 반영 (원형 정리·사본 없이)
                 +SVerticalBox::Slot().AutoHeight().Padding(5)[SNew(SCheckBox).IsChecked_Lambda([this](){auto* P=GetPlan();return P&&P->bLiveApply?ECheckBoxState::Checked:ECheckBoxState::Unchecked;}).OnCheckStateChanged_Lambda([this](ECheckBoxState S){if(auto* P=GetPlan()){P->Modify();P->bLiveApply=S==ECheckBoxState::Checked;P->MarkPackageDirty();LiveNote.Reset();if(P->bLiveApply)LiveDue=FPlatformTime::Seconds();else LiveDue=0;}})
                     .ToolTipText(T(TEXT("값을 바꾸면 지형에 바로 반영 · 먼저 한 번 '지형에 적용'이 필요")))[SNew(STextBlock).Text_Lambda([this](){return FText::FromString(LiveNote.IsEmpty()?FString(TEXT("바로 반영")):FString::Printf(TEXT("바로 반영  (%s)"),*LiveNote));})]]
-                +SVerticalBox::Slot().AutoHeight().Padding(5)[SNew(STextBlock).AutoWrapText(true).Text(T(TEXT("청록 낮음\n노랑 높음\n빨강 급경사\n사각 손잡이 = 크기\n자유 모양 점: 네모 = 뾰족 · 동그라미 = 둥글게 (오른쪽 클릭으로 바꿈) · 테두리 더블클릭 = 점 추가")))]]
+                +SVerticalBox::Slot().AutoHeight().Padding(5)[SNew(STextBlock).AutoWrapText(true).Text(T(TEXT("청록 낮음\n노랑 높음\n빨강 급경사\n사각 손잡이 = 크기\n자유 모양 점: 네모 = 뾰족 · 동그라미 = 둥글게 (오른쪽 클릭으로 바꿈) · 테두리 더블클릭 = 점 추가\n주황 선 = 산 안쪽 띠 (눌러 고름)")))]]
             +SSplitter::Slot().Value(.53f)[SAssignNew(Map,SMap,SharedThis(this))]
             +SSplitter::Slot().Value(.32f)[SNew(SVerticalBox)
                 +SVerticalBox::Slot().AutoHeight().Padding(4)[SNew(STextBlock).Text_Lambda([this](){auto* P=GetPlan();if(P&&P->Recipe.Landforms.IsValidIndex(Selected))return FText::FromString(P->Recipe.Landforms[Selected].Name);if(P&&P->Recipe.Routes.IsValidIndex(Route))return FText::FromString(P->Recipe.Routes[Route].Name);return T(TEXT("선택 요소 / 전체 설계"));})]
@@ -303,6 +356,28 @@ public:
                 +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&F->EdgeMode==ECozyEdgeMode::Angle);})[Number(TEXT("경사 각도 (도)"),5,85,[this]()->TOptional<float>{const auto* F=Sel();if(F)return F->SlopeAngle;return {};},[this](float V){Mutate([this,V](ACozyTerrainLayout& P){if(P.Recipe.Landforms.IsValidIndex(Selected))P.Recipe.Landforms[Selected].SlopeAngle=FMath::Clamp(V,5.f,85.f);});})]]
                 // 산만: 0%는 뾰족한 봉우리, 클수록 꼭대기가 넓고 옆면이 가파름
                 +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&F->Type==ECozyLandform::Mountain&&F->EdgeMode==ECozyEdgeMode::Width);})[Number(TEXT("꼭대기 넓이 (%)"),0,90,[this]()->TOptional<float>{auto* P=GetPlan();if(P&&P->Recipe.Landforms.IsValidIndex(Selected)&&P->Recipe.Landforms[Selected].Type==ECozyLandform::Mountain)return P->Recipe.Landforms[Selected].PeakFlat;return {};},[this](float V){Mutate([this,V](auto& P){if(P.Recipe.Landforms.IsValidIndex(Selected)&&P.Recipe.Landforms[Selected].Type==ECozyLandform::Mountain)P.Recipe.Landforms[Selected].PeakFlat=FMath::Clamp(V,0.f,90.f);});})]]
+                // 안쪽 띠 (자유 모양 산만): 띠와 띠 사이를 부드럽게 잇고 가장 안쪽 띠 안은 꼭대기 높이까지
+                +SVerticalBox::Slot().AutoHeight().Padding(4,6,4,2)[SNew(STextBlock).AutoWrapText(true).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&HasBands(*F));}).Text_Lambda([this]()
+                {
+                    const auto* F=Sel();if(!F)return FText::GetEmpty();const int B=BandOf(*F);
+                    if(B!=INDEX_NONE)return FText::FromString(FString::Printf(TEXT("안쪽 띠 %d / %d 고름 · 점 %d개 · %s  (점 끌기 · 선 더블클릭 점 추가 · Esc 바깥 모양으로)"),B+1,F->Bands.Num(),F->Bands[B].Points.Num(),*MetersText(F->Bands[B].Height)));
+                    return FText::FromString(FString::Printf(TEXT("안쪽 띠 %d개  (주황 선을 눌러 고르기)"),F->Bands.Num()));
+                })]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&HasBands(*F));})[SNew(SHorizontalBox)
+                    +SHorizontalBox::Slot().FillWidth(1).Padding(2)[SNew(SBox).ToolTipText(T(TEXT("산 안쪽에 같은 높이를 잇는 띠(등고선)를 직접 그립니다. 자유 모양 그리기와 같은 방법입니다.")))[Button(TEXT("띠 그리기"),[this](){StartBandDraw();})]]
+                    +SHorizontalBox::Slot().FillWidth(1).Padding(2)[SNew(SBox).ToolTipText(T(TEXT("아래 '띠 수'만큼 띠를 무작위로 만듭니다. 있던 띠는 바뀝니다 (되돌리기로 복구).")))[Button(TEXT("띠 자동 만들기"),[this](){AutoBands();})]]]]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&HasBands(*F));})[Number(TEXT("띠 수"),1,8,[this]()->TOptional<float>{return float(BandCount);},[this](float V){BandCount=FMath::Clamp(FMath::RoundToInt(V),1,8);})]]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){return Show(SelBand()!=nullptr);})[Number(TEXT("띠 높이 (m)"),-20,120,[this]()->TOptional<float>{if(const auto* B=SelBand())return B->Height;return {};},[this](float V){EditSel([this,V](FCozyLandform& L){if(L.Bands.IsValidIndex(Band))L.Bands[Band].Height=FMath::Clamp(V,-200.f,200.f);});})]]
+                +SVerticalBox::Slot().AutoHeight().Padding(2)[SNew(SBox).Visibility_Lambda([this](){return Show(SelBand()!=nullptr);})[Button(TEXT("띠 지우기"),[this](){DeleteBand();})]]
+                // 랜덤: 표면 울퉁불퉁 · 테두리 들쭉날쭉 (자유 모양만) · 씨앗을 바꾸면 같은 세기로 다른 모양
+                +SVerticalBox::Slot().AutoHeight().Padding(4,6,4,2)[SNew(STextBlock).Visibility_Lambda([this](){return Show(Sel()!=nullptr);}).Text(T(TEXT("랜덤")))]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){return Show(Sel()!=nullptr);}).ToolTipText(T(TEXT("표면을 울퉁불퉁하게 하는 높이(m) · 0이면 매끈")))[Number(TEXT("울퉁불퉁 세기 (m)"),0,30,[this]()->TOptional<float>{if(const auto* F=Sel())return F->NoiseAmount;return {};},[this](float V){EditSel([V](FCozyLandform& L){L.NoiseAmount=FMath::Clamp(V,0.f,30.f);});})]]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){return Show(Sel()!=nullptr);}).ToolTipText(T(TEXT("울퉁불퉁 한 덩어리의 크기(m) · 작으면 자글자글, 크면 큰 언덕")))[Number(TEXT("울퉁불퉁 크기 (m)"),2,300,[this]()->TOptional<float>{if(const auto* F=Sel())return F->NoiseSize;return {};},[this](float V){EditSel([V](FCozyLandform& L){L.NoiseSize=FMath::Clamp(V,2.f,300.f);});})]]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&IsFree(*F));}).ToolTipText(T(TEXT("테두리와 띠 선을 구불구불하게 미는 정도(m) · 0이면 그린 그대로")))[Number(TEXT("테두리 들쭉날쭉 (m)"),0,30,[this]()->TOptional<float>{if(const auto* F=Sel())return F->EdgeJitter;return {};},[this](float V){EditSel([V](FCozyLandform& L){L.EdgeJitter=FMath::Clamp(V,0.f,30.f);});})]]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){const auto* F=Sel();return Show(F&&IsFree(*F));}).ToolTipText(T(TEXT("구불거림 한 번의 길이(m) · 작으면 잘게, 크면 크게 구불거림")))[Number(TEXT("들쭉날쭉 간격 (m)"),2,120,[this]()->TOptional<float>{if(const auto* F=Sel())return F->EdgeJitterSize;return {};},[this](float V){EditSel([V](FCozyLandform& L){L.EdgeJitterSize=FMath::Clamp(V,2.f,200.f);});})]]
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){return Show(Sel()!=nullptr);})[SNew(SHorizontalBox)
+                    +SHorizontalBox::Slot().AutoWidth().Padding(2)[SNew(SBox).ToolTipText(T(TEXT("같은 세기로 다른 모양이 나오게 랜덤 씨앗을 바꿉니다 (되돌리기로 복구)")))[Button(TEXT("다시 섞기"),[this](){EditSel([](FCozyLandform& L){int32 S=L.RandomSeed;while(S==L.RandomSeed)S=FMath::Rand();L.RandomSeed=S;});if(const auto* F=Sel())Message(FString::Printf(TEXT("랜덤을 다시 섞었습니다 (씨앗 %d)."),F->RandomSeed));})]]
+                    +SHorizontalBox::Slot().FillWidth(1).Padding(6,2).VAlign(VAlign_Center)[SNew(STextBlock).Text_Lambda([this](){const auto* F=Sel();return F?FText::FromString(FString::Printf(TEXT("씨앗 %d"),F->RandomSeed)):FText::GetEmpty();})]]]
                 +SVerticalBox::Slot().AutoHeight().Padding(4,8,4,2)[SNew(STextBlock).Text_Lambda([this](){return FText::FromString(FString::Printf(TEXT("요소 목록 (%d개)"),Items.Num()));})]
                 +SVerticalBox::Slot().AutoHeight().Padding(2)[SNew(SBox).HeightOverride(150)[SAssignNew(List,SListView<TSharedPtr<int32>>).ListItemsSource(&Items).SelectionMode(ESelectionMode::Single)
                     .OnGenerateRow_Lambda([this](TSharedPtr<int32> Item,const TSharedRef<STableViewBase>& Owner){const int32 Id=*Item;return SNew(STableRow<TSharedPtr<int32>>,Owner)[SNew(STextBlock).Text_Lambda([this,Id](){return ItemText(Id);})];})
@@ -345,11 +420,41 @@ static FVector2D ToMap(FVector2D P,const FVector2D& Size,const FVector2D& Span){
 static FVector2D FromMap(FVector2D P,const FVector2D& Size,const FVector2D& Span){FVector2D O,D;FitMap(Size,Span,O,D);P-=O;return FVector2D((P.X/D.X-.5)*Span.X,(.5-P.Y/D.Y)*Span.Y);}
 // 지도 1픽셀이 몇 m인지 (점 끼워 넣기 거리 판정용)
 static double PixelMeters(const FVector2D& Size,const FVector2D& Span){FVector2D O,D;FitMap(Size,Span,O,D);return Span.X/FMath::Max(1.,D.X);}
-int SMap::HitPoint(const FVector2D& Size,const ACozyTerrainLayout& P,const FCozyLandform& F,FVector2D Mouse) const
+int SMap::HitPoint(const FVector2D& Size,const ACozyTerrainLayout& P,const FCozyLandform& F,const TArray<FCozyShapePoint>& Pts,FVector2D Mouse) const
 {
     int Best=INDEX_NONE;double Near=9;
-    for(int K=0;K<F.Points.Num();++K){const double D=FVector2D::Distance(Mouse,ToMap(ToWorld(F,F.Points[K].Position),Size,P.Recipe.MapSize));if(D<=Near){Near=D;Best=K;}}
+    for(int K=0;K<Pts.Num();++K){const double D=FVector2D::Distance(Mouse,ToMap(ToWorld(F,Pts[K].Position),Size,P.Recipe.MapSize));if(D<=Near){Near=D;Best=K;}}
     return Best;
+}
+bool SMap::HitBand(const FVector2D& Size,const ACozyTerrainLayout& P,const FCozyLandform& F,FVector2D Mouse,int& OutBand,int& OutPoint) const
+{
+    OutBand=OutPoint=INDEX_NONE;if(!HasBands(F))return false;
+    const FVector2D Local=ToLocal(F,FromMap(Mouse,Size,P.Recipe.MapSize));const float Reach=float(8*PixelMeters(Size,P.Recipe.MapSize));
+    // 위(안쪽·나중에 그린 띠)부터 · 점 손잡이가 선보다 먼저
+    for(int B=F.Bands.Num()-1;B>=0;--B){const int H=HitPoint(Size,P,F,F.Bands[B].Points,Mouse);if(H!=INDEX_NONE){OutBand=B;OutPoint=H;return true;}}
+    for(int B=F.Bands.Num()-1;B>=0;--B){const FCozyPolyShape S=LinePoly(F,B);if(S.IsValid()&&CozyTerrainShape::FindSpan(S,Local,Reach)!=INDEX_NONE){OutBand=B;return true;}}
+    return false;
+}
+void SMap::FinishDraw(SPanel& O,ACozyTerrainLayout& P){if(O.Mode==5)FinishBand(O,P);else FinishFree(O,P);}
+void SMap::FinishBand(SPanel& O,ACozyTerrainLayout& P)
+{
+    if(DrawPts.Num()<3){O.Message(TEXT("점을 3개 이상 찍어야 띠를 닫을 수 있습니다."));return;}
+    const FCozyLandform* F=O.Sel();
+    if(!F||!HasBands(*F)){DrawPts.Reset();bHover=false;O.Mode=0;O.Message(TEXT("띠는 자유 모양 산을 고른 뒤 그릴 수 있습니다."));return;}
+    // 산 중심 기준·회전 전 좌표로 (바깥 모양 점과 같은 기준)
+    TArray<FCozyShapePoint> Pts;TArray<FVector2D> Local;
+    for(const FVector2D& V:DrawPts){FCozyShapePoint S;S.Position=R1(ToLocal(*F,V));Pts.Add(S);Local.Add(S.Position);}
+    // 기본 높이: 이 띠를 감싼 띠(없으면 산기슭 0m)와 꼭대기의 가운데
+    const FVector2D Mid=CozyTerrainShape::Centroid(Local);float Below=0;
+    for(const FCozyContourBand& B:F->Bands)if(B.Points.Num()>=3&&B.Height>Below){FCozyPolyShape S;CozyTerrainShape::BuildPolyline(B.Points,12,S);if(CozyTerrainShape::Contains(S,Mid))Below=B.Height;}
+    const float Height=FMath::RoundToFloat((Below+F->Height)*5)/10;
+    DrawPts.Reset();bHover=false;O.Mode=0;
+    O.Mutate([&O,&Pts,Height](ACozyTerrainLayout& A)
+    {
+        if(!A.Recipe.Landforms.IsValidIndex(O.Selected))return;
+        FCozyContourBand B;B.Points=Pts;B.Height=Height;O.Band=A.Recipe.Landforms[O.Selected].Bands.Add(B);O.Point=INDEX_NONE;
+    });
+    if(const FCozyContourBand* B=O.SelBand())O.Message(FString::Printf(TEXT("안쪽 띠를 만들었습니다 (점 %d개 · %s). 오른쪽 '띠 높이'로 높이를 바꾸세요. 선택 도구로 돌아갔습니다."),B->Points.Num(),*MetersText(B->Height)));
 }
 void SMap::FinishFree(SPanel& O,ACozyTerrainLayout& P)
 {
@@ -413,14 +518,27 @@ int32 SMap::OnPaint(const FPaintArgs&,const FGeometry& G,const FSlateRect&,FSlat
         const auto& F=P->Recipe.Landforms[I];const FLinearColor C=Owner->Selected==I?FLinearColor(.1,.9,1):FLinearColor(.95,.95,.85);
         if(IsFree(F))
         {
-            // 자유 모양: 곡선을 꺾은선으로 펼쳐 그림
-            const FCozyPolyShape S=FreePoly(F);
-            if(S.IsValid()){TArray<FVector2D> V;for(const FVector2D& Q:S.Poly)V.Add(ToMap(ToWorld(F,Q),Size,P->Recipe.MapSize));V.Add(FVector2D(V[0]));FSlateDrawElement::MakeLines(Out,L+2,G.ToPaintGeometry(),V,ESlateDrawEffect::None,C,true,Owner->Selected==I?3.f:1.f);}
-            if(Owner->Selected==I)for(int K=0;K<F.Points.Num();++K)
+            // 자유 모양: 곡선을 꺾은선으로 펼쳐 그림 (테두리 들쭉날쭉까지 · 지형과 같게)
+            const int SelBand=Owner->Selected==I?Owner->BandOf(F):INDEX_NONE;
+            const FCozyPolyShape S=LinePoly(F,INDEX_NONE);
+            if(S.IsValid()){TArray<FVector2D> V;for(const FVector2D& Q:S.Poly)V.Add(ToMap(ToWorld(F,Q),Size,P->Recipe.MapSize));V.Add(FVector2D(V[0]));FSlateDrawElement::MakeLines(Out,L+2,G.ToPaintGeometry(),V,ESlateDrawEffect::None,C,true,Owner->Selected==I&&SelBand==INDEX_NONE?3.f:Owner->Selected==I?2.f:1.f);}
+            // 안쪽 띠: 주황 선 + 높이 글자 (고른 띠는 굵게)
+            if(HasBands(F))for(int B=0;B<F.Bands.Num();++B)
+            {
+                const FCozyPolyShape BS=LinePoly(F,B);if(!BS.IsValid())continue;
+                const FLinearColor BC=SelBand==B?FLinearColor(1,.75,.2):FLinearColor(1,.55,.15,Owner->Selected==I?.95f:.6f);
+                TArray<FVector2D> V;int Top=0;for(const FVector2D& Q:BS.Poly){V.Add(ToMap(ToWorld(F,Q),Size,P->Recipe.MapSize));if(V.Last().Y<V[Top].Y)Top=V.Num()-1;}
+                const FVector2D LabelAt=V[Top]+FVector2D(3,-15);V.Add(FVector2D(V[0]));
+                FSlateDrawElement::MakeLines(Out,L+2,G.ToPaintGeometry(),V,ESlateDrawEffect::None,BC,true,SelBand==B?3.f:1.5f);
+                FSlateDrawElement::MakeText(Out,L+3,G.ToPaintGeometry(FVector2f(Size),FSlateLayoutTransform(FVector2f(LabelAt))),MetersText(F.Bands[B].Height),FAppStyle::GetFontStyle("SmallFont"),ESlateDrawEffect::None,BC);
+            }
+            // 점 손잡이는 고른 대상(띠를 골랐으면 그 띠, 아니면 바깥 모양)만
+            const TArray<FCozyShapePoint>& Pts=Owner->Selected==I?Owner->EditPoints(F):F.Points;const FLinearColor HC=SelBand!=INDEX_NONE?FLinearColor(1,.75,.2):C;
+            if(Owner->Selected==I)for(int K=0;K<Pts.Num();++K)
             {
                 // 점 손잡이: 네모 = 뾰족 · 동그라미 = 둥글게 · 고른 점은 노랑
-                const FVector2D H=ToMap(ToWorld(F,F.Points[K].Position),Size,P->Recipe.MapSize);const FLinearColor PC=Owner->Point==K?FLinearColor(1,.85,.1):C;
-                if(F.Points[K].bSharp)FSlateDrawElement::MakeBox(Out,L+4,G.ToPaintGeometry(FVector2f(10,10),FSlateLayoutTransform(FVector2f(H-FVector2D(5,5)))),Brush,ESlateDrawEffect::None,PC);
+                const FVector2D H=ToMap(ToWorld(F,Pts[K].Position),Size,P->Recipe.MapSize);const FLinearColor PC=Owner->Point==K?(SelBand!=INDEX_NONE?FLinearColor::White:FLinearColor(1,.85,.1)):HC;
+                if(Pts[K].bSharp)FSlateDrawElement::MakeBox(Out,L+4,G.ToPaintGeometry(FVector2f(10,10),FSlateLayoutTransform(FVector2f(H-FVector2D(5,5)))),Brush,ESlateDrawEffect::None,PC);
                 else{TArray<FVector2D> Ring;for(int A=0;A<=12;++A){const double R=A*2*PI/12;Ring.Add(H+FVector2D(FMath::Cos(R),FMath::Sin(R))*5.5);}FSlateDrawElement::MakeLines(Out,L+4,G.ToPaintGeometry(),Ring,ESlateDrawEffect::None,PC,true,2.5f);}
             }
         }
@@ -439,10 +557,11 @@ int32 SMap::OnPaint(const FPaintArgs&,const FGeometry& G,const FSlateRect&,FSlat
             FSlateDrawElement::MakeBox(Out,L+4,G.ToPaintGeometry(FVector2f(9,9),FSlateLayoutTransform(FVector2f(B-FVector2D(4.5,4.5)))),Brush,ESlateDrawEffect::None,FLinearColor(.1,.8,1));
         }
     }
-    if(Owner->Mode==4&&DrawPts.Num())
+    if(Owner->IsDrawing()&&DrawPts.Num())
     {
-        // 그리는 중인 자유 모양: 찍은 점을 곧게 잇고, 마우스까지·첫 점으로 돌아가는 선은 점선
-        const FLinearColor Draw(1,.85,.1),Faint(1,.85,.1,.45);
+        // 그리는 중인 자유 모양(노랑)·띠(주황): 찍은 점을 곧게 잇고, 마우스까지·첫 점으로 돌아가는 선은 점선
+        const bool bBandDraw=Owner->Mode==5;
+        const FLinearColor Draw=bBandDraw?FLinearColor(1,.55,.15):FLinearColor(1,.85,.1),Faint=bBandDraw?FLinearColor(1,.55,.15,.45):FLinearColor(1,.85,.1,.45);
         TArray<FVector2D> V;for(const FVector2D& Q:DrawPts)V.Add(ToMap(Q,Size,P->Recipe.MapSize));
         if(V.Num()>1)FSlateDrawElement::MakeLines(Out,L+3,G.ToPaintGeometry(),V,ESlateDrawEffect::None,Draw,true,2.f);
         auto Dashed=[&](FVector2D A,FVector2D B){const double Len=FVector2D::Distance(A,B);const FVector2D Dir=(B-A)/FMath::Max(Len,.001);for(double D=0;D<Len;D+=10)Line(A+Dir*D,A+Dir*FMath::Min(D+6,Len),Faint,1.5f);};
@@ -463,19 +582,21 @@ FReply SMap::OnMouseButtonDown(const FGeometry& G,const FPointerEvent& E)
     // 고른 자유 모양의 점을 오른쪽 클릭 → 뾰족하게/둥글게 전환
     if(E.GetEffectingButton()==EKeys::RightMouseButton)
     {
-        const FCozyLandform* F=O->Mode==0?O->Sel():nullptr;const int H=F&&IsFree(*F)?HitPoint(Size,*P,*F,Mouse):INDEX_NONE;
+        // 고른 대상(띠 또는 바깥 모양)의 점 · 고른 띠가 없으면 띠 점을 눌러도 그 띠를 고르며 바꿈
+        const FCozyLandform* F=O->Mode==0?O->Sel():nullptr;int H=F&&IsFree(*F)?HitPoint(Size,*P,*F,O->EditPoints(*F),Mouse):INDEX_NONE;
+        if(H==INDEX_NONE&&F&&O->BandOf(*F)==INDEX_NONE){int B,K;if(HitBand(Size,*P,*F,Mouse,B,K)&&K!=INDEX_NONE){O->Band=B;H=K;}}
         if(H==INDEX_NONE)return FReply::Unhandled();
-        O->Point=H;O->Mutate([O,H](ACozyTerrainLayout& A){if(A.Recipe.Landforms.IsValidIndex(O->Selected)&&A.Recipe.Landforms[O->Selected].Points.IsValidIndex(H)){auto& S=A.Recipe.Landforms[O->Selected].Points[H];S.bSharp=!S.bSharp;}});
-        F=O->Sel();if(F&&F->Points.IsValidIndex(H))O->Message(F->Points[H].bSharp?TEXT("점을 뾰족하게 바꿨습니다 (다시 오른쪽 클릭하면 둥글게)"):TEXT("점을 둥글게 바꿨습니다 (다시 오른쪽 클릭하면 뾰족하게)"));
+        O->Point=H;O->Mutate([O,H](ACozyTerrainLayout& A){if(A.Recipe.Landforms.IsValidIndex(O->Selected)){auto& Pts=O->EditPoints(A.Recipe.Landforms[O->Selected]);if(Pts.IsValidIndex(H))Pts[H].bSharp=!Pts[H].bSharp;}});
+        F=O->Sel();if(F&&O->EditPoints(*F).IsValidIndex(H))O->Message(O->EditPoints(*F)[H].bSharp?TEXT("점을 뾰족하게 바꿨습니다 (다시 오른쪽 클릭하면 둥글게)"):TEXT("점을 둥글게 바꿨습니다 (다시 오른쪽 클릭하면 뾰족하게)"));
         return FReply::Handled().SetUserFocus(SharedThis(this));
     }
     if(E.GetEffectingButton()!=EKeys::LeftMouseButton)return FReply::Unhandled();
     // 지도 밖 여백을 누르면 아무것도 하지 않음
     if(FMath::Abs(Pos.X)>P->Recipe.MapSize.X*.5+1||FMath::Abs(Pos.Y)>P->Recipe.MapSize.Y*.5+1)return FReply::Handled();
-    if(O->Mode==4)
+    if(O->IsDrawing())
     {
         // 첫 점 가까이(10픽셀) 누르면 닫기 · 아니면 점 추가 (0.1m 단위)
-        if(DrawPts.Num()>=3&&FVector2D::Distance(Mouse,ToMap(DrawPts[0],Size,P->Recipe.MapSize))<=10){FinishFree(*O,*P);return FReply::Handled().SetUserFocus(SharedThis(this));}
+        if(DrawPts.Num()>=3&&FVector2D::Distance(Mouse,ToMap(DrawPts[0],Size,P->Recipe.MapSize))<=10){FinishDraw(*O,*P);return FReply::Handled().SetUserFocus(SharedThis(this));}
         const FVector2D Q=R1(FVector2D(FMath::Clamp(Pos.X,-P->Recipe.MapSize.X*.5,P->Recipe.MapSize.X*.5),FMath::Clamp(Pos.Y,-P->Recipe.MapSize.Y*.5,P->Recipe.MapSize.Y*.5)));
         if(DrawPts.Num()<128&&(DrawPts.IsEmpty()||FVector2D::Distance(DrawPts.Last(),Q)>.05))DrawPts.Add(Q);
         O->Status=FString::Printf(TEXT("점 %d개 · 첫 점을 다시 누르거나 Enter·더블클릭으로 닫기 (3개 이상) · Backspace 마지막 점 지우기 · Esc 취소"),DrawPts.Num());
@@ -496,7 +617,7 @@ FReply SMap::OnMouseButtonDown(const FGeometry& G,const FPointerEvent& E)
             // 누른 곳 땅 높이를 0.1m 단위로 (영지 안이면 아래 맞춤에서 층 높이로)
             F.Height=bPlateau?FMath::RoundToFloat(P->Sample(Pos)*10)/10:25;
             F.Name=FString::Printf(TEXT("%s %d"),bPlateau?TEXT("평지"):TEXT("산·능선"),P->Recipe.Landforms.Num()+1);
-            O->Selected=P->Recipe.Landforms.Add(F);O->Route=O->Node=O->Point=INDEX_NONE;
+            O->Selected=P->Recipe.Landforms.Add(F);O->Route=O->Node=O->Point=O->Band=INDEX_NONE;
             bCreating=true;bResize=bPointDrag=false;CreateStart=FVector2D(FMath::RoundToDouble(Pos.X*10)/10,FMath::RoundToDouble(Pos.Y*10)/10);CreateStartPixel=Mouse;
             P->bHasUnappliedChanges=true;P->bShowPreview=true;O->Refresh();
             return FReply::Handled().CaptureMouse(SharedThis(this)).SetUserFocus(SharedThis(this));
@@ -508,10 +629,20 @@ FReply SMap::OnMouseButtonDown(const FGeometry& G,const FPointerEvent& E)
     {
         if(IsFree(*F))
         {
-            // 점 손잡이 → 그 점 끌기 · 테두리 가까이 → 고른 채로 둠 (밖이어도 · 테두리 더블클릭 점 추가가 되게)
-            const int H=HitPoint(Size,*P,*F,Mouse);
+            // 점 손잡이(고른 띠 또는 바깥 모양) → 그 점 끌기 · 다른 띠의 선·점 → 그 띠 고르기 · 테두리 가까이 → 바깥 모양 고른 채로 (밖이어도 · 더블클릭 점 추가가 되게)
+            const int H=HitPoint(Size,*P,*F,O->EditPoints(*F),Mouse);int HB,HK;
             if(H!=INDEX_NONE){O->Point=H;bPointDrag=true;}
-            else{const FCozyPolyShape S=FreePoly(*F);bKeep=S.IsValid()&&CozyTerrainShape::FindSpan(S,ToLocal(*F,Pos),float(8*PixelMeters(Size,P->Recipe.MapSize)))!=INDEX_NONE;O->Point=INDEX_NONE;}
+            else if(HitBand(Size,*P,*F,Mouse,HB,HK))
+            {
+                O->Band=HB;O->Point=HK;bPointDrag=HK!=INDEX_NONE;bKeep=true;
+                O->Status=FString::Printf(TEXT("안쪽 띠 %d 고름 (%s) · 점 끌기 · 선 더블클릭 점 추가 · 점 오른쪽 클릭 뾰족/둥글게 · Delete 점(또는 띠) 지우기 · Esc 바깥 모양으로"),HB+1,*MetersText(F->Bands[HB].Height));
+            }
+            else
+            {
+                const FCozyPolyShape S=LinePoly(*F,INDEX_NONE);O->Point=INDEX_NONE;
+                bKeep=S.IsValid()&&CozyTerrainShape::FindSpan(S,ToLocal(*F,Pos),float(8*PixelMeters(Size,P->Recipe.MapSize)))!=INDEX_NONE;
+                if(bKeep)O->Band=INDEX_NONE;
+            }
         }
         else bResize=FVector2D::Distance(Mouse,ToMap(F->Center+F->Size*.5,Size,P->Recipe.MapSize))<14;
     }
@@ -521,6 +652,8 @@ FReply SMap::OnMouseButtonDown(const FGeometry& G,const FPointerEvent& E)
         for(int R=0;R<P->Recipe.Routes.Num();++R)for(int I=0;I<P->Recipe.Routes[R].Points.Num();++I)
             if(FVector2D::Distance(Mouse,ToMap(FVector2D(P->Recipe.Routes[R].Points[I]),Size,P->Recipe.MapSize))<13){O->Route=R;O->Node=I;}
         if(O->Route==INDEX_NONE)O->Selected=O->HitLandform(*P,Pos);
+        // 안 고른 산의 띠 선을 눌렀으면 산과 그 띠를 함께 고름 (끌면 산 전체가 움직임)
+        int HB,HK;if(const FCozyLandform* F=O->Sel())if(HitBand(Size,*P,*F,Mouse,HB,HK)){O->Band=HB;O->Status=FString::Printf(TEXT("안쪽 띠 %d 고름 (%s) · 점을 끌어 모양 · 오른쪽 '띠 높이'로 높이 · Esc 바깥 모양으로"),HB+1,*MetersText(F->Bands[HB].Height));}
     }
     // 통째로 옮길 때 누른 곳과 중심의 차이를 유지 (중심이 마우스로 튀지 않게)
     if(const FCozyLandform* F=O->Sel())DragOffset=F->Center-R1(Pos);
@@ -531,7 +664,7 @@ FReply SMap::OnMouseMove(const FGeometry& G,const FPointerEvent& E)
 {
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;
     // 자유 모양 그리는 중: 마우스까지 미리보기 선
-    if(O&&P&&O->Mode==4){HoverPixel=G.AbsoluteToLocal(E.GetScreenSpacePosition());bHover=true;if(DrawPts.Num())Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();}
+    if(O&&P&&O->IsDrawing()){HoverPixel=G.AbsoluteToLocal(E.GetScreenSpacePosition());bHover=true;if(DrawPts.Num())Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();}
     if(!Drag||!P||!HasMouseCapture())return FReply::Unhandled();
     FVector2D Pos=FromMap(G.AbsoluteToLocal(E.GetScreenSpacePosition()),G.GetLocalSize(),P->Recipe.MapSize);
     // 끌어서 바꾸는 위치·크기는 0.1m 단위 (31.103222 같은 값이 나오지 않게)
@@ -541,8 +674,8 @@ FReply SMap::OnMouseMove(const FGeometry& G,const FPointerEvent& E)
     else if(P->Recipe.Landforms.IsValidIndex(O->Selected))
     {
         auto& F=P->Recipe.Landforms[O->Selected];
-        // 자유 모양 점 끌기 (영지 칸 맞춤은 놓을 때 한 번)
-        if(bPointDrag&&IsFree(F)&&F.Points.IsValidIndex(O->Point)){F.Points[O->Point].Position=R1(ToLocal(F,Pos));FitFreeSize(F);}
+        // 자유 모양(또는 고른 띠) 점 끌기 (영지 칸 맞춤은 놓을 때 한 번)
+        if(bPointDrag&&IsFree(F)&&O->EditPoints(F).IsValidIndex(O->Point)){O->EditPoints(F)[O->Point].Position=R1(ToLocal(F,Pos));FitFreeSize(F);}
         else
         {
             if(bResize&&!IsFree(F))F.Size=FVector2D(FMath::Clamp(FMath::Abs(Pos.X-F.Center.X)*2,2.,2000.),FMath::Clamp(FMath::Abs(Pos.Y-F.Center.Y)*2,2.,2000.));
@@ -580,21 +713,22 @@ FReply SMap::OnMouseButtonDoubleClick(const FGeometry& G,const FPointerEvent& E)
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;if(!P||E.GetEffectingButton()!=EKeys::LeftMouseButton||GEditor->PlayWorld)return FReply::Unhandled();
     const FVector2D Size=G.GetLocalSize(),Mouse=G.AbsoluteToLocal(E.GetScreenSpacePosition()),Pos=FromMap(Mouse,Size,P->Recipe.MapSize);
     // 그리는 중 더블클릭 = 닫기 (첫 번째 클릭에서 이미 점이 찍힘)
-    if(O->Mode==4){if(DrawPts.Num()>=3){FinishFree(*O,*P);return FReply::Handled().SetUserFocus(SharedThis(this));}return OnMouseButtonDown(G,E);}
-    // 고른 자유 모양의 테두리 더블클릭 = 그 자리에 점 끼워 넣기
-    if(O->Mode==0)if(const FCozyLandform* F=O->Sel())if(IsFree(*F)&&F->Points.Num()<128&&HitPoint(Size,*P,*F,Mouse)==INDEX_NONE)
+    if(O->IsDrawing()){if(DrawPts.Num()>=3){FinishDraw(*O,*P);return FReply::Handled().SetUserFocus(SharedThis(this));}return OnMouseButtonDown(G,E);}
+    // 고른 자유 모양(또는 고른 띠)의 선 더블클릭 = 그 자리에 점 끼워 넣기
+    if(O->Mode==0)if(const FCozyLandform* F=O->Sel())if(IsFree(*F)&&O->EditPoints(*F).Num()<128&&HitPoint(Size,*P,*F,O->EditPoints(*F),Mouse)==INDEX_NONE)
     {
-        const FCozyPolyShape S=FreePoly(*F);const FVector2D Local=ToLocal(*F,Pos),Loc=R1(Local);
+        const bool bBand=O->BandOf(*F)!=INDEX_NONE;
+        const FCozyPolyShape S=LinePoly(*F,O->BandOf(*F));const FVector2D Local=ToLocal(*F,Pos),Loc=R1(Local);
         const int Span=S.IsValid()?CozyTerrainShape::FindSpan(S,Local,float(8*PixelMeters(Size,P->Recipe.MapSize))):INDEX_NONE;
         if(Span!=INDEX_NONE)
         {
             O->Mutate([O,Span,Loc](ACozyTerrainLayout& A)
             {
                 if(!A.Recipe.Landforms.IsValidIndex(O->Selected))return;
-                auto& L=A.Recipe.Landforms[O->Selected];FCozyShapePoint New;New.Position=Loc;
-                const int At=FMath::Min(Span+1,L.Points.Num());L.Points.Insert(New,At);FitFreeSize(L);O->Point=At;
+                auto& L=A.Recipe.Landforms[O->Selected];auto& Pts=O->EditPoints(L);FCozyShapePoint New;New.Position=Loc;
+                const int At=FMath::Min(Span+1,Pts.Num());Pts.Insert(New,At);FitFreeSize(L);O->Point=At;
             });
-            O->Message(TEXT("점을 끼워 넣었습니다 · 끌어 옮기기 · 오른쪽 클릭 뾰족/둥글게 · Delete 지우기"));
+            O->Message(bBand?TEXT("띠에 점을 끼워 넣었습니다 · 끌어 옮기기 · 오른쪽 클릭 뾰족/둥글게 · Delete 지우기"):TEXT("점을 끼워 넣었습니다 · 끌어 옮기기 · 오른쪽 클릭 뾰족/둥글게 · Delete 지우기"));
             return FReply::Handled().SetUserFocus(SharedThis(this));
         }
     }
@@ -604,14 +738,16 @@ void SMap::OnMouseCaptureLost(const FCaptureLostEvent&){bCreating=bPointDrag=fal
 FReply SMap::OnKeyDown(const FGeometry&,const FKeyEvent& E)
 {
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;if(!P)return FReply::Unhandled();
-    if(O->Mode==4)
+    if(O->IsDrawing())
     {
         // 자유 모양 그리는 중: Enter 닫기 · Backspace 마지막 점 지우기 · Esc 취소
-        if(E.GetKey()==EKeys::Enter){FinishFree(*O,*P);return FReply::Handled();}
+        if(E.GetKey()==EKeys::Enter){FinishDraw(*O,*P);return FReply::Handled();}
         if(E.GetKey()==EKeys::BackSpace||E.GetKey()==EKeys::Delete){if(DrawPts.Num())DrawPts.RemoveAt(DrawPts.Num()-1);O->Status=FString::Printf(TEXT("점 %d개 · 마지막 점을 지웠습니다"),DrawPts.Num());Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();}
-        if(E.GetKey()==EKeys::Escape){DrawPts.Reset();bHover=false;O->Mode=0;O->Message(TEXT("자유 모양 그리기를 취소했습니다 · 선택 도구"));return FReply::Handled();}
+        if(E.GetKey()==EKeys::Escape){const bool bBand=O->Mode==5;DrawPts.Reset();bHover=false;O->Mode=0;O->Message(bBand?TEXT("띠 그리기를 취소했습니다 · 선택 도구"):TEXT("자유 모양 그리기를 취소했습니다 · 선택 도구"));return FReply::Handled();}
     }
     if(E.GetKey()==EKeys::Delete||E.GetKey()==EKeys::BackSpace){O->DeleteSelected();return FReply::Handled();}
+    // 띠를 골랐으면 Esc는 띠만 놓고 산은 고른 채로
+    if(E.GetKey()==EKeys::Escape&&O->SelBand()){O->Mode=0;O->Band=O->Point=INDEX_NONE;O->Message(TEXT("띠 선택 해제 · 산(바깥 모양)을 고른 상태"));return FReply::Handled();}
     if(E.GetKey()==EKeys::Escape){O->Mode=0;O->SelectNone();O->Message(TEXT("선택 도구 · 선택 해제"));return FReply::Handled();}
     return FReply::Unhandled();
 }

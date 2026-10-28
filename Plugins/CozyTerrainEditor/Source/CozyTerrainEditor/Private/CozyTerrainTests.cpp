@@ -1,4 +1,5 @@
 #include "CozyTerrainLayout.h"
+#include "CozyTerrainShape.h"
 #include "Misc/AutomationTest.h"
 #include "JsonObjectConverter.h"
 #include "Misc/Paths.h"
@@ -179,6 +180,203 @@ bool FCozyTerrainFreeSnapTest::RunTest(const FString&)
     TestFalse(TEXT("이미 맞춘 모양은 다시 바뀌지 않음"),Plan->SnapLandform(F));
     FCozyLandform Far=F;Far.Center=FVector2D(50,50);Far.Height=3;
     TestFalse(TEXT("영지 밖 자유 평지는 자유"),Plan->SnapLandform(Far));
+    return true;
+}
+namespace CozyTerrainBandTestUtil
+{
+    // 중심 Off · 반 변 Half 정사각형 (모두 뾰족 → 꺾은선이 조절점 다각형과 같음)
+    TArray<FCozyShapePoint> Square(double Half,FVector2D Off=FVector2D::ZeroVector)
+    {
+        TArray<FCozyShapePoint> R;
+        for(const FVector2D& C:{FVector2D(-1,-1),FVector2D(1,-1),FVector2D(1,1),FVector2D(-1,1)}){FCozyShapePoint Pt;Pt.Position=Off+C*Half;Pt.bSharp=true;R.Add(Pt);}
+        return R;
+    }
+    FCozyContourBand Band(double Half,float Height,FVector2D Off=FVector2D::ZeroVector){FCozyContourBand B;B.Points=Square(Half,Off);B.Height=Height;return B;}
+    FCozyLandform FreeLandform(ECozyLandform Type,float Height,double Half,ECozyEdgeMode Mode)
+    {FCozyLandform F;F.Type=Type;F.Shape=ECozyLandformShape::Free;F.Height=Height;F.Blend=4;F.EdgeMode=Mode;F.SlopeAngle=45;F.Points=Square(Half);return F;}
+    bool Near(float A,float B,float Tol){return FMath::Abs(A-B)<=Tol;}
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainBandsTest,"CozyRealm.TerrainEditor.ContourBands",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyTerrainBandsTest::RunTest(const FString&)
+{
+    using namespace CozyTerrainBandTestUtil;
+    FString Error;
+    // 띠 없는 자유 모양 산: 띠 이전 계산식과 같음 (매끈한 점·회전 포함)
+    {
+        FCozyLandform F=FreeLandform(ECozyLandform::Mountain,25,1,ECozyEdgeMode::Width);F.Center=FVector2D(5,-3);F.Rotation=20;F.PeakFlat=20;F.Points.Reset();
+        for(const FVector2D& P:{FVector2D(-22,-15),FVector2D(18,-20),FVector2D(25,10),FVector2D(-5,22),FVector2D(-20,8)}){FCozyShapePoint Pt;Pt.Position=P;F.Points.Add(Pt);}
+        FCozyPolyShape Poly;CozyTerrainShape::BuildPolyline(F.Points,12,Poly);CozyTerrainShape::Prepare(Poly);
+        float Worst=0;
+        for(int Mode=0;Mode<2;++Mode)
+        {
+            F.EdgeMode=Mode?ECozyEdgeMode::Angle:ECozyEdgeMode::Width;FCozyTerrainRecipe R;R.Landforms.Add(F);
+            for(int Y=-8;Y<=8;++Y)for(int X=-8;X<=8;++X)
+            {
+                const FVector2D P(X*5.3,Y*4.7),Q=(P-F.Center).GetRotated(-F.Rotation);const double D=CozyTerrainShape::SignedDistance(Poly,Q);
+                const double T=F.PeakFlat/100.,Rr=FMath::Max(0.,1+D/Poly.MaxInset-T)/(1-T);
+                const float Legacy=Mode?float(FMath::Min(25.,FMath::Max(0.,-D)*FMath::Tan(FMath::DegreesToRadians(45.)))):float(25*FMath::Exp(-2*Rr*Rr));
+                Worst=FMath::Max(Worst,FMath::Abs(R.Evaluate(P,0)-Legacy));
+            }
+        }
+        TestTrue(TEXT("띠 없는 자유 모양 산은 이전과 같음"),Worst<1e-3f);
+    }
+    // 바깥 40m 정사각형(산기슭 0) · 안쪽 20m 띠 10m · 꼭대기 20m · 경사 각도(곧게)
+    FCozyLandform M=FreeLandform(ECozyLandform::Mountain,20,20,ECozyEdgeMode::Angle);M.Bands.Add(Band(10,10));
+    FCozyTerrainRecipe R;R.Landforms.Add(M);
+    TestTrue(TEXT("띠 있는 산 설정 유효"),R.Validate(Error));
+    TestTrue(TEXT("산기슭은 0"),Near(R.Evaluate(FVector2D(20,0),0),0,1e-3f)&&Near(R.Evaluate(FVector2D(25,0),0),0,1e-6f));
+    TestTrue(TEXT("산기슭과 띠 가운데는 5"),Near(R.Evaluate(FVector2D(15,0),0),5,.05f)&&Near(R.Evaluate(FVector2D(0,-15),0),5,.05f));
+    TestTrue(TEXT("띠 위는 띠 높이 10"),Near(R.Evaluate(FVector2D(10,0),0),10,.05f));
+    TestTrue(TEXT("띠 안 가운데쯤은 15"),Near(R.Evaluate(FVector2D(5,0),0),15,.3f));
+    TestTrue(TEXT("가장 깊은 곳은 꼭대기 20"),Near(R.Evaluate(FVector2D(0,0),0),20,.3f));
+    bool bMono=true;float Prev=R.Evaluate(FVector2D(0,0),0);
+    for(int I=1;I<=46;++I){const float H=R.Evaluate(FVector2D(I*.5,0),0);bMono&=H<=Prev+1e-4f;Prev=H;}
+    TestTrue(TEXT("가운데에서 바깥으로 내려감"),bMono);
+    // 연결 폭: 띠 사이를 부드럽게 (가운데는 같고, 산기슭 가까이는 곧은 비탈보다 낮음)
+    FCozyTerrainRecipe Soft=R;Soft.Landforms[0].EdgeMode=ECozyEdgeMode::Width;
+    TestTrue(TEXT("연결 폭 띠 사이 가운데 5"),Near(Soft.Evaluate(FVector2D(15,0),0),5,.05f));
+    TestTrue(TEXT("연결 폭 산기슭 가까이 완만"),Soft.Evaluate(FVector2D(17,0),0)<R.Evaluate(FVector2D(17,0),0)-.3f);
+    TestTrue(TEXT("연결 폭 산기슭 밖 0"),Near(Soft.Evaluate(FVector2D(24,0),0),0,1e-6f));
+    // 띠를 옆으로 옮기면 봉우리도 따라감
+    FCozyTerrainRecipe Off=R;Off.Landforms[0].Bands[0]=Band(10,10,FVector2D(8,0));
+    TestTrue(TEXT("옮긴 띠 가운데가 꼭대기"),Near(Off.Evaluate(FVector2D(8,0),0),20,.3f)&&Off.Evaluate(FVector2D(0,0),0)<15);
+    // 꼭대기 넓이 50%: 띠 가장 깊은 곳 절반 안쪽은 꼭대기 높이
+    FCozyTerrainRecipe Mesa=R;Mesa.Landforms[0].PeakFlat=50;
+    TestTrue(TEXT("꼭대기 넓이로 윗부분 평평"),Near(Mesa.Evaluate(FVector2D(4,0),0),20,.3f));
+    // 꼭대기가 띠보다 낮으면 띠 안은 띠 높이로 평평
+    FCozyTerrainRecipe Low=R;Low.Landforms[0].Height=8;
+    TestTrue(TEXT("꼭대기가 띠보다 낮으면 띠 안은 평평"),Near(Low.Evaluate(FVector2D(0,0),0),10,1e-3f));
+    // 구덩이: 모든 높이를 뒤집으면 결과도 뒤집힘
+    FCozyTerrainRecipe Pit=R;Pit.Landforms[0].Height=-20;Pit.Landforms[0].Bands[0].Height=-10;
+    float WorstPit=0;
+    for(int Y=-6;Y<=6;++Y)for(int X=-6;X<=6;++X){const FVector2D P(X*3.7,Y*3.3);WorstPit=FMath::Max(WorstPit,FMath::Abs(Pit.Evaluate(P,0)+R.Evaluate(P,0)));}
+    TestTrue(TEXT("구덩이는 산과 대칭"),WorstPit<1e-3f);
+    // 겹친 띠 두 개 (5m · 15m)
+    FCozyTerrainRecipe Two=R;Two.Landforms[0].Bands={Band(7,15),Band(14,5)};
+    TestTrue(TEXT("두 띠 설정 유효"),Two.Validate(Error));
+    TestTrue(TEXT("산기슭~첫 띠 가운데 2.5"),Near(Two.Evaluate(FVector2D(17,0),0),2.5f,.05f));
+    TestTrue(TEXT("첫 띠 위 5"),Near(Two.Evaluate(FVector2D(14,0),0),5,.05f));
+    TestTrue(TEXT("두 띠 가운데 10"),Near(Two.Evaluate(FVector2D(10.5,0),0),10,.05f));
+    TestTrue(TEXT("둘째 띠 위 15"),Near(Two.Evaluate(FVector2D(7,0),0),15,.05f));
+    TestTrue(TEXT("두 띠 산 꼭대기 20"),Near(Two.Evaluate(FVector2D(0,0),0),20,.3f));
+    // 띠는 자유 모양 산에만: 평지·타원 산에서는 무시
+    FCozyTerrainRecipe Flat;Flat.Landforms.Add(FreeLandform(ECozyLandform::Plateau,6,10,ECozyEdgeMode::Width));
+    FCozyTerrainRecipe FlatBands=Flat;FlatBands.Landforms[0].Bands.Add(Band(5,30));
+    FCozyTerrainRecipe Ell;FCozyLandform E;E.Type=ECozyLandform::Mountain;E.Size=FVector2D(40,40);E.Height=20;Ell.Landforms.Add(E);
+    FCozyTerrainRecipe EllBands=Ell;EllBands.Landforms[0].Bands.Add(Band(5,30));
+    bool bIgnored=FlatBands.Validate(Error)&&EllBands.Validate(Error);
+    for(int X=-15;X<=15;++X){const FVector2D P(X,X*.4);bIgnored&=FlatBands.Evaluate(P,0)==Flat.Evaluate(P,0)&&EllBands.Evaluate(P,0)==Ell.Evaluate(P,0);}
+    TestTrue(TEXT("평지·타원의 띠는 무시"),bIgnored);
+    // 검사
+    FCozyTerrainRecipe Bad=R;Bad.Landforms[0].Bands[0].Points.SetNum(2);
+    TestFalse(TEXT("점 2개 띠 거부"),Bad.Validate(Error));
+    Bad=R;Bad.Landforms[0].Bands[0].Height=500;
+    TestFalse(TEXT("범위 밖 띠 높이 거부"),Bad.Validate(Error));
+    Bad=R;Bad.Landforms[0].Bands[0].Points[0].Position.X=1e10;
+    TestFalse(TEXT("범위 밖 띠 점 거부"),Bad.Validate(Error));
+    Bad=R;Bad.Landforms[0].Bands.Init(Band(5,5),33);
+    TestFalse(TEXT("띠 33개 거부"),Bad.Validate(Error));
+    // 저장·복원
+    FString Json;FJsonObjectConverter::UStructToJsonObjectString(Two,Json);FCozyTerrainRecipe Back;
+    TestTrue(TEXT("띠 저장·복원"),FJsonObjectConverter::JsonObjectStringToUStruct(Json,&Back,0,0)&&Back.Landforms[0].Bands.Num()==2&&Back.Evaluate(FVector2D(10.5,0),0)==Two.Evaluate(FVector2D(10.5,0),0));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainRandomTest,"CozyRealm.TerrainEditor.RandomNoiseJitter",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyTerrainRandomTest::RunTest(const FString&)
+{
+    using namespace CozyTerrainBandTestUtil;
+    FString Error;
+    // 잡음 함수 약속: 같은 씨앗 같은 값 · 대략 -1~1
+    bool bRange=true,bSameNoise=true;
+    for(int I=0;I<200;++I){const FVector2D P(I*1.37-100,I*.73-50);const float N=CozyTerrainShape::Noise2D(P,20,7);bRange&=FMath::IsFinite(N)&&FMath::Abs(N)<=1.2f;bSameNoise&=N==CozyTerrainShape::Noise2D(P,20,7);}
+    TestTrue(TEXT("잡음 범위 대략 ±1"),bRange);TestTrue(TEXT("잡음 결정적"),bSameNoise);
+    // 표면 울퉁불퉁 · 경사 각도 자유 산 (밖은 정확히 0)
+    FCozyTerrainRecipe Base;Base.Landforms.Add(FreeLandform(ECozyLandform::Mountain,10,20,ECozyEdgeMode::Angle));
+    FCozyTerrainRecipe Seeded=Base;Seeded.Landforms[0].RandomSeed=99;Seeded.Landforms[0].NoiseSize=8;
+    FCozyTerrainRecipe Bumpy=Base;Bumpy.Landforms[0].NoiseAmount=5;Bumpy.Landforms[0].NoiseSize=8;
+    FCozyTerrainRecipe Other=Bumpy;Other.Landforms[0].RandomSeed=2;
+    TestTrue(TEXT("울퉁불퉁 설정 유효"),Bumpy.Validate(Error));
+    int Diff=0,SeedDiff=0;bool bZeroSame=true,bRepeat=true,bBounded=true;
+    for(int Y=-9;Y<=9;++Y)for(int X=-9;X<=9;++X)
+    {
+        const FVector2D P(X*2.1,Y*1.9);const float B=Base.Evaluate(P,0),N=Bumpy.Evaluate(P,0);
+        bZeroSame&=Seeded.Evaluate(P,0)==B;bRepeat&=Bumpy.Evaluate(P,0)==N;bBounded&=FMath::Abs(N-B)<=5*1.2f+1e-3f;
+        Diff+=FMath::Abs(N-B)>1e-3f;SeedDiff+=FMath::Abs(Other.Evaluate(P,0)-N)>1e-3f;
+    }
+    TestTrue(TEXT("세기 0이면 씨앗과 무관하게 그대로"),bZeroSame);
+    TestTrue(TEXT("울퉁불퉁이 높이를 바꿈"),Diff>10);
+    TestTrue(TEXT("같은 씨앗은 같은 결과"),bRepeat);
+    TestTrue(TEXT("다른 씨앗은 다른 결과"),SeedDiff>10);
+    TestTrue(TEXT("잡음 폭은 세기 안"),bBounded);
+    TestTrue(TEXT("산기슭·바깥은 잡음 없음"),Bumpy.Evaluate(FVector2D(20,3),0)==Base.Evaluate(FVector2D(20,3),0)&&Bumpy.Evaluate(FVector2D(26,0),0)==0.f);
+    // 띠 있는 산에도 · 산기슭 밖은 0
+    FCozyTerrainRecipe BandBumpy=Bumpy;BandBumpy.Landforms[0].Bands.Add(Band(10,6));
+    TestTrue(TEXT("띠 산 바깥 잡음 없음"),BandBumpy.Evaluate(FVector2D(23,0),0)==0.f);
+    // 평지 목표 높이에 울퉁불퉁 · 영향 밖은 그대로
+    FCozyTerrainRecipe Flat;Flat.Landforms.Add(FreeLandform(ECozyLandform::Plateau,6,10,ECozyEdgeMode::Width));Flat.Landforms[0].NoiseAmount=3;Flat.Landforms[0].NoiseSize=5;
+    int FlatDiff=0;for(int X=-8;X<=8;++X)FlatDiff+=FMath::Abs(Flat.Evaluate(FVector2D(X,X*.5),0)-6)>1e-3f;
+    TestTrue(TEXT("평지 안이 울퉁불퉁"),FlatDiff>3);
+    TestTrue(TEXT("평지 먼 바깥은 그대로"),Flat.Evaluate(FVector2D(30,0),0)==0.f);
+    Flat.Landforms[0].EdgeMode=ECozyEdgeMode::Angle;
+    TestTrue(TEXT("각도 평지 먼 바깥은 그대로"),Flat.Evaluate(FVector2D(40,0),0)==0.f);
+    // 테두리 들쭉날쭉 · 평지 테두리 근처 안팎이 달라짐
+    FCozyTerrainRecipe Edge;Edge.Landforms.Add(FreeLandform(ECozyLandform::Plateau,6,10,ECozyEdgeMode::Width));Edge.Landforms[0].Blend=1;
+    FCozyTerrainRecipe EdgeZero=Edge;EdgeZero.Landforms[0].EdgeJitterSize=40;EdgeZero.Landforms[0].RandomSeed=5;
+    FCozyTerrainRecipe Jag=Edge;Jag.Landforms[0].EdgeJitter=3;Jag.Landforms[0].EdgeJitterSize=6;
+    FCozyTerrainRecipe Jag2=Jag;Jag2.Landforms[0].RandomSeed=8;
+    TestTrue(TEXT("들쭉날쭉 설정 유효"),Jag.Validate(Error));
+    int EdgeDiff=0,EdgeSeedDiff=0;bool bEdgeZero=true,bEdgeRepeat=true,bCore=true;
+    for(int I=0;I<160;++I)
+    {
+        // 테두리 둘레 (반 변 8~12m) 를 돌며
+        const double A=I*UE_TWO_PI/160,Rad=8+(I%5);const FVector2D P(FMath::Cos(A)*Rad,FMath::Sin(A)*Rad);
+        const float H=Edge.Evaluate(P,0),J=Jag.Evaluate(P,0);
+        bEdgeZero&=EdgeZero.Evaluate(P,0)==H;bEdgeRepeat&=Jag.Evaluate(P,0)==J;
+        EdgeDiff+=FMath::Abs(J-H)>1e-3f;EdgeSeedDiff+=FMath::Abs(Jag2.Evaluate(P,0)-J)>1e-3f;
+    }
+    for(int I=-3;I<=3;++I)bCore&=Jag.Evaluate(FVector2D(I,-I),0)==6.f;
+    TestTrue(TEXT("들쭉날쭉 0이면 그대로"),bEdgeZero);
+    TestTrue(TEXT("들쭉날쭉이 테두리를 바꿈"),EdgeDiff>5);
+    TestTrue(TEXT("같은 씨앗 같은 테두리"),bEdgeRepeat);
+    TestTrue(TEXT("다른 씨앗 다른 테두리"),EdgeSeedDiff>5);
+    TestTrue(TEXT("가운데는 그대로 목표 높이"),bCore);
+    FCozyTerrainRecipe Bad=Jag;Bad.Landforms[0].EdgeJitter=-1;TestFalse(TEXT("음수 들쭉날쭉 거부"),Bad.Validate(Error));
+    Bad=Jag;Bad.Landforms[0].NoiseAmount=100;TestFalse(TEXT("과도한 울퉁불퉁 거부"),Bad.Validate(Error));
+    // 설계 액터 캐시: 들쭉날쭉·씨앗·띠 점·띠 높이를 바꾸면 다시 계산 (한 점 계산과 같아야 함)
+    ACozyTerrainLayout* Plan=NewObject<ACozyTerrainLayout>(GetTransientPackage(),NAME_None,RF_Transient);
+    Plan->Recipe=FCozyTerrainRecipe();Plan->Recipe.Landforms.Add(FreeLandform(ECozyLandform::Mountain,20,20,ECozyEdgeMode::Width));Plan->Recipe.Landforms[0].Bands.Add(Band(10,10));
+    auto Matches=[&]{bool b=true;for(int Y=-5;Y<=5;++Y)for(int X=-5;X<=5;++X){const FVector2D P(X*4.3,Y*4.1);b&=Plan->Sample(P)==Plan->Recipe.Evaluate(P,0);}return b;};
+    bool bCache=Matches();
+    auto& L=Plan->Recipe.Landforms[0];
+    L.EdgeJitter=4;bCache&=Matches();
+    L.RandomSeed=3;bCache&=Matches();
+    L.EdgeJitterSize=30;bCache&=Matches();
+    L.Bands[0].Height=14;bCache&=Matches();
+    L.Bands[0].Points[0].Position.X-=3;bCache&=Matches();
+    L.Bands.Add(Band(5,17));bCache&=Matches();
+    L.Type=ECozyLandform::Plateau;bCache&=Matches();
+    L.Type=ECozyLandform::Mountain;L.Bands.Reset();bCache&=Matches();
+    TestTrue(TEXT("캐시가 들쭉날쭉·씨앗·띠 변경을 따라감"),bCache);
+    Plan->MarkAsGarbage();
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainSnapRandomTest,"CozyRealm.TerrainEditor.EstateSnapClearsRandom",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyTerrainSnapRandomTest::RunTest(const FString&)
+{
+    // 영지 층은 시설 자리 → 맞추면 들쭉날쭉·울퉁불퉁을 끈다
+    const ACozyTerrainLayout* Plan=GetDefault<ACozyTerrainLayout>();
+    FCozyLandform F;F.Shape=ECozyLandformShape::Free;F.Height=2.4f;F.Points=CozyTerrainBandTestUtil::Square(4);F.EdgeJitter=3;F.NoiseAmount=2;
+    TestTrue(TEXT("자유 평지 맞춤"),Plan->SnapLandform(F));
+    TestTrue(TEXT("자유 평지 들쭉날쭉·울퉁불퉁 0"),F.EdgeJitter==0&&F.NoiseAmount==0);
+    TestFalse(TEXT("한 번 맞춘 뒤에는 바뀌지 않음"),Plan->SnapLandform(F));
+    F.NoiseAmount=1;TestTrue(TEXT("울퉁불퉁만 다시 켜도 맞춤"),Plan->SnapLandform(F)&&F.NoiseAmount==0);
+    FCozyLandform E;E.Size=FVector2D(8,6);E.NoiseAmount=4;E.EdgeJitter=2;
+    Plan->SnapLandform(E);
+    TestTrue(TEXT("타원 평지 울퉁불퉁 0"),E.NoiseAmount==0&&E.EdgeJitter==0);
+    FCozyLandform Hill=F;Hill.Type=ECozyLandform::Mountain;Hill.NoiseAmount=3;
+    TestTrue(TEXT("산은 그대로"),!Plan->SnapLandform(Hill)&&Hill.NoiseAmount==3);
+    FCozyLandform Far=F;Far.Center=FVector2D(80,80);Far.NoiseAmount=3;
+    TestTrue(TEXT("영지 밖은 그대로"),!Plan->SnapLandform(Far)&&Far.NoiseAmount==3);
     return true;
 }
 // 별도 검증 프로세스에서만 새 임시 맵을 만든다. 일반 전체 검사에서는 현재 맵을 건드리지 않는다.
