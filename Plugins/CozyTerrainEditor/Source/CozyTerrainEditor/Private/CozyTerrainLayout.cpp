@@ -1,4 +1,5 @@
 #include "CozyTerrainLayout.h"
+#include "CozyTerrainShape.h"
 #include "ProceduralMeshComponent.h"
 #include "Landscape.h"
 #include "LandscapeInfo.h"
@@ -23,8 +24,16 @@ bool FCozyTerrainRecipe::Validate(FString& Reason) const
     if(Version!=1||Components<1||Components>8||!Finite(MapSize.X)||!Finite(MapSize.Y)||MapSize.X<63||MapSize.Y<63||MapSize.X>1008||MapSize.Y>1008||!Finite(BaseHeight)||FMath::Abs(BaseHeight)>200||Landforms.Num()>128||Routes.Num()>64)
     {Reason=TEXT("영역은 63~1008m, 구획은 1~8, 기본 높이는 ±200m 범위여야 합니다.");return false;}
     for(const auto& F:Landforms)
+    {
         if(!Finite(F.Center.X)||!Finite(F.Center.Y)||!Finite(F.Size.X)||!Finite(F.Size.Y)||F.Size.X<2||F.Size.Y<2||F.Size.X>2000||F.Size.Y>2000||!Finite(F.Height)||FMath::Abs(F.Height)>200||!Finite(F.Blend)||F.Blend<1||F.Blend>200||!Finite(F.Rotation)||!Finite(F.PeakFlat)||F.PeakFlat<0||F.PeakFlat>90||uint8(F.Type)>1)
         {Reason=TEXT("평지·산의 크기·높이·주변 연결 수치를 확인하세요.");return false;}
+        if(uint8(F.Shape)>1||uint8(F.EdgeMode)>1||!Finite(F.SlopeAngle)||F.SlopeAngle<5||F.SlopeAngle>85)
+        {Reason=TEXT("평지·산의 모양 종류와 경사 각도(5~85도)를 확인하세요.");return false;}
+        if(F.Shape==ECozyLandformShape::Free&&(F.Points.Num()<3||F.Points.Num()>256))
+        {Reason=TEXT("자유 모양은 점이 3~256개여야 합니다.");return false;}
+        for(const auto& Pt:F.Points) if(!Finite(Pt.Position.X)||!Finite(Pt.Position.Y)||FMath::Abs(Pt.Position.X)>2000||FMath::Abs(Pt.Position.Y)>2000)
+        {Reason=TEXT("자유 모양 점의 위치를 확인하세요.");return false;}
+    }
     for(const auto& R:Routes)
     {
         if(!Finite(R.Width)||R.Width<2||R.Width>80||!Finite(R.Blend)||R.Blend<1||R.Blend>80||R.Points.Num()>256)
@@ -35,41 +44,119 @@ bool FCozyTerrainRecipe::Validate(FString& Reason) const
     return true;
 }
 
+// 자유 모양 꺾은선은 평가 한 바퀴(미리보기·적용)마다 한 번만 만든다 · 점이 그대로면 다시 만들지 않음
+struct FCozyPreparedShapes
+{
+    TArray<FCozyPolyShape> Shapes; TArray<TArray<FCozyShapePoint>> Keys;
+    void Update(const FCozyTerrainRecipe& R)
+    {
+        const int N=R.Landforms.Num(); Shapes.SetNum(N); Keys.SetNum(N);
+        auto Same=[](const TArray<FCozyShapePoint>& A,const TArray<FCozyShapePoint>& B){if(A.Num()!=B.Num())return false;for(int I=0;I<A.Num();++I)if(A[I].Position!=B[I].Position||A[I].bSharp!=B[I].bSharp)return false;return true;};
+        for(int I=0;I<N;++I)
+        {
+            const auto& F=R.Landforms[I];
+            if(F.Shape!=ECozyLandformShape::Free||F.Points.Num()<3||F.Points.Num()>256){if(Keys[I].Num()||Shapes[I].Poly.Num()){Keys[I].Reset();Shapes[I]=FCozyPolyShape();}continue;}
+            if(Keys[I].Num()&&Same(Keys[I],F.Points)) continue;
+            Keys[I]=F.Points;Shapes[I]=FCozyPolyShape();CozyTerrainShape::BuildPolyline(F.Points,12,Shapes[I]);CozyTerrainShape::Prepare(Shapes[I]);
+        }
+    }
+    const FCozyPolyShape* Get(const FCozyTerrainRecipe& R,int I) const{return R.Landforms[I].Shape==ECozyLandformShape::Free&&Shapes.IsValidIndex(I)&&Shapes[I].IsValid()?&Shapes[I]:nullptr;}
+};
+
+// 단일 빌드(unity)에서 다른 파일 이름과 섞이지 않게 이름 공간을 둔다
+namespace CozyTerrainEval
+{
+    double SlopeTan(const FCozyLandform& F){return FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(double(F.SlopeAngle),5.,85.)));}
+    // 타원 정규화 거리 (1이 테두리)
+    double EllipseNorm(const FCozyLandform& F,FVector2D Q){return FMath::Sqrt(FMath::Square(Q.X/FMath::Max(1.,F.Size.X*.5))+FMath::Square(Q.Y/FMath::Max(1.,F.Size.Y*.5)));}
+    // 경사 각도 방식의 타원: (정규화 거리−1)×짧은 반지름을 테두리까지 거리(m)로 근사 · 바깥 양수, 안쪽 음수
+    double EllipseHalf(const FCozyLandform& F){return FMath::Min(FMath::Max(1.,F.Size.X*.5),FMath::Max(1.,F.Size.Y*.5));}
+    // 꼭대기 넓이 T 안은 꼭대기 높이 그대로, 그 바깥부터 줄어듦 (T가 클수록 옆면이 가파름) · D는 1이 테두리
+    float PeakProfile(const FCozyLandform& F,double D){const double T=FMath::Clamp(F.PeakFlat,0.f,90.f)/100.,R=FMath::Max(0.,D-T)/(1-T);return float(F.Height*FMath::Exp(-2*R*R));}
+    // 경사 각도 산: 테두리가 산기슭, 안쪽으로 정한 각도로 곧게 오르다가 높이에 닿으면 평평한 꼭대기
+    float SlopeBump(const FCozyLandform& F,double Depth){return float(FMath::Sign(double(F.Height))*FMath::Min(double(FMath::Abs(F.Height)),FMath::Max(0.,Depth)*SlopeTan(F)));}
+    // 경사 각도 평지: 안은 목표 높이, 밖은 정한 각도의 곧은 비탈로 주변 높이까지 내려가거나 올라감
+    float Terrace(float B,float T,double D,double S){if(D<=0)return T;return T>=B?FMath::Max(B,float(T-D*S)):FMath::Min(B,float(T+D*S));}
+
+    // 길은 마지막에 (평지·산 위를 덮음)
+    float EvaluateRoutes(const FCozyTerrainRecipe& Rec,FVector2D P,float H)
+    {
+        float BestWeight=0,BestHeight=H; double BestDistance=DBL_MAX;
+        for(const auto& R:Rec.Routes) for(int I=1;I<R.Points.Num();++I)
+        {
+            const FVector2D A(R.Points[I-1]),B(R.Points[I]),D=B-A;
+            const double T=FMath::Clamp(FVector2D::DotProduct(P-A,D)/FMath::Max(.00001,D.SizeSquared()),0.,1.);
+            const double Distance=FVector2D::Distance(P,A+D*T);
+            const float W=1-FMath::SmoothStep(R.Width*.5f,R.Width*.5f+R.Blend,float(Distance));
+            if(W>BestWeight||(W==BestWeight&&Distance<BestDistance))
+            {BestWeight=W;BestDistance=Distance;BestHeight=FMath::Lerp(R.Points[I-1].Z,R.Points[I].Z,T);}
+        }
+        return FMath::Lerp(H,BestHeight,BestWeight);
+    }
+
+    float EvaluateRecipe(const FCozyTerrainRecipe& Rec,const FCozyPreparedShapes& S,FVector2D P,float Base)
+    {
+        // 산끼리 겹치면 높이를 더하지 않고 부드럽게 높은 쪽을 따른다 (더하면 겹친 곳이 두 배로 솟았음)
+        // 이음매 폭 K는 높이에 비례 (산에서 먼 평지에서는 0이라 바닥이 들뜨지 않음)
+        auto SmoothMax=[](float A,float B){const float K=FMath::Min(4.f,.25f*FMath::Max(A,B));if(K<=KINDA_SMALL_NUMBER)return FMath::Max(A,B);const float W=FMath::Max(K-FMath::Abs(A-B),0.f)/K;return FMath::Max(A,B)+W*W*K*.25f;};
+        const auto& Landforms=Rec.Landforms;
+        float Up=0,Down=0;
+        for(int I=0;I<Landforms.Num();++I)
+        {
+            const auto& F=Landforms[I];
+            if(F.Type!=ECozyLandform::Mountain) continue;
+            const FVector2D Q=(P-F.Center).GetRotated(-F.Rotation);
+            const bool bAngle=F.EdgeMode==ECozyEdgeMode::Angle; float Bump;
+            if(F.Shape==ECozyLandformShape::Free)
+            {
+                const FCozyPolyShape* Poly=S.Get(Rec,I);
+                if(!Poly||Poly->MaxInset<=KINDA_SMALL_NUMBER) continue;
+                // 각도 방식은 안쪽만, 폭 방식은 깊이의 3배 밖이면 사실상 0 → 상자 밖은 건너뜀
+                if(!Poly->Bounds.ExpandBy(bAngle?.01:3.*Poly->MaxInset).IsInside(Q)) continue;
+                const double D=CozyTerrainShape::SignedDistance(*Poly,Q);
+                // 폭 방식: 가장 깊은 곳 0 · 테두리 1 (타원 정규화 거리와 같은 뜻)
+                Bump=bAngle?SlopeBump(F,-D):PeakProfile(F,1+D/Poly->MaxInset);
+            }
+            else
+            {
+                const double D=EllipseNorm(F,Q);
+                Bump=bAngle?SlopeBump(F,(1-D)*EllipseHalf(F)):PeakProfile(F,D);
+            }
+            if(Bump>=0)Up=SmoothMax(Up,Bump);else Down=-SmoothMax(-Down,-Bump);
+        }
+        float H=Base+Up+Down;
+        for(int I=0;I<Landforms.Num();++I)
+        {
+            const auto& F=Landforms[I];
+            if(F.Type==ECozyLandform::Mountain) continue;
+            const FVector2D Q=(P-F.Center).GetRotated(-F.Rotation);
+            const bool bAngle=F.EdgeMode==ECozyEdgeMode::Angle;
+            double D;
+            if(F.Shape==ECozyLandformShape::Free)
+            {
+                const FCozyPolyShape* Poly=S.Get(Rec,I); if(!Poly) continue;
+                // 영향이 닿는 거리 밖이면 높이 그대로
+                const double Reach=bAngle?FMath::Abs(F.Height-H)/SlopeTan(F):F.Blend;
+                if(!Poly->Bounds.ExpandBy(Reach+.01).IsInside(Q)) continue;
+                D=CozyTerrainShape::SignedDistance(*Poly,Q);
+                if(!bAngle){H=FMath::Lerp(H,F.Height,D<=0?1.f:1-FMath::SmoothStep(0.f,F.Blend,float(D)));continue;}
+            }
+            else
+            {
+                const double N=EllipseNorm(F,Q);
+                if(!bAngle){H=FMath::Lerp(H,F.Height,float(1-FMath::SmoothStep(1.,1.+F.Blend/FMath::Max(1.,FMath::Min(F.Size.X,F.Size.Y)*.5),N)));continue;}
+                D=(N-1)*EllipseHalf(F);
+            }
+            H=Terrace(H,F.Height,D,SlopeTan(F));
+        }
+        return EvaluateRoutes(Rec,P,H);
+    }
+}
+
 float FCozyTerrainRecipe::Evaluate(FVector2D P,float Base) const
 {
-    // 산끼리 겹치면 높이를 더하지 않고 부드럽게 높은 쪽을 따른다 (더하면 겹친 곳이 두 배로 솟았음)
-    // 이음매 폭 K는 높이에 비례 (산에서 먼 평지에서는 0이라 바닥이 들뜨지 않음)
-    auto SmoothMax=[](float A,float B){const float K=FMath::Min(4.f,.25f*FMath::Max(A,B));if(K<=KINDA_SMALL_NUMBER)return FMath::Max(A,B);const float W=FMath::Max(K-FMath::Abs(A-B),0.f)/K;return FMath::Max(A,B)+W*W*K*.25f;};
-    float Up=0,Down=0;
-    for(const auto& F:Landforms)
-    {
-        if(F.Type!=ECozyLandform::Mountain) continue;
-        const FVector2D Q=(P-F.Center).GetRotated(-F.Rotation);
-        const double D=FMath::Sqrt(FMath::Square(Q.X/FMath::Max(1.,F.Size.X*.5))+FMath::Square(Q.Y/FMath::Max(1.,F.Size.Y*.5)));
-        // 꼭대기 넓이 T 안은 꼭대기 높이 그대로, 그 바깥부터 줄어듦 (T가 클수록 옆면이 가파름)
-        const double T=FMath::Clamp(F.PeakFlat,0.f,90.f)/100.,R=FMath::Max(0.,D-T)/(1-T);
-        const float Bump=F.Height*FMath::Exp(-2*R*R);
-        if(Bump>=0)Up=SmoothMax(Up,Bump);else Down=-SmoothMax(-Down,-Bump);
-    }
-    float H=Base+Up+Down;
-    for(const auto& F:Landforms)
-    {
-        if(F.Type==ECozyLandform::Mountain) continue;
-        const FVector2D Q=(P-F.Center).GetRotated(-F.Rotation);
-        const double D=FMath::Sqrt(FMath::Square(Q.X/FMath::Max(1.,F.Size.X*.5))+FMath::Square(Q.Y/FMath::Max(1.,F.Size.Y*.5)));
-        H=FMath::Lerp(H,F.Height,float(1-FMath::SmoothStep(1.,1.+F.Blend/FMath::Max(1.,FMath::Min(F.Size.X,F.Size.Y)*.5),D)));
-    }
-    float BestWeight=0,BestHeight=H; double BestDistance=DBL_MAX;
-    for(const auto& R:Routes) for(int I=1;I<R.Points.Num();++I)
-    {
-        const FVector2D A(R.Points[I-1]),B(R.Points[I]),D=B-A;
-        const double T=FMath::Clamp(FVector2D::DotProduct(P-A,D)/FMath::Max(.00001,D.SizeSquared()),0.,1.);
-        const double Distance=FVector2D::Distance(P,A+D*T);
-        const float W=1-FMath::SmoothStep(R.Width*.5f,R.Width*.5f+R.Blend,float(Distance));
-        if(W>BestWeight||(W==BestWeight&&Distance<BestDistance))
-        {BestWeight=W;BestDistance=Distance;BestHeight=FMath::Lerp(R.Points[I-1].Z,R.Points[I].Z,T);}
-    }
-    return FMath::Lerp(H,BestHeight,BestWeight);
+    // 한 점만 계산할 때(검사 등)는 그 자리에서 모양을 만든다 · 반복 계산은 ACozyTerrainLayout의 캐시를 쓴다
+    FCozyPreparedShapes S;S.Update(*this);return CozyTerrainEval::EvaluateRecipe(*this,S,P,Base);
 }
 
 ACozyTerrainLayout::ACozyTerrainLayout()
@@ -102,7 +189,15 @@ float ACozyTerrainLayout::SampleApplied(FVector2D P) const
 }
 
 float ACozyTerrainLayout::Sample(FVector2D P) const{return SampleWith(Recipe,P);}
-float ACozyTerrainLayout::SampleWith(const FCozyTerrainRecipe& R,FVector2D P) const{return R.Evaluate(P,BaselineHeight(P)+R.BaseHeight);}
+float ACozyTerrainLayout::SampleWith(const FCozyTerrainRecipe& R,FVector2D P) const{return SampleFast(R,PreparedFor(R),P);}
+float ACozyTerrainLayout::SampleFast(const FCozyTerrainRecipe& R,const FCozyPreparedShapes& S,FVector2D P) const{return CozyTerrainEval::EvaluateRecipe(R,S,P,BaselineHeight(P)+R.BaseHeight);}
+const FCozyPreparedShapes& ACozyTerrainLayout::PreparedFor(const FCozyTerrainRecipe& R) const
+{
+    // 지금 설계와 적용분은 따로 보관 (미리보기가 둘을 번갈아 계산해도 다시 만들지 않게) · 점이 바뀐 것만 새로 만듦
+    TSharedPtr<FCozyPreparedShapes>& Cache=&R==&Recipe?PreparedNow:PreparedApplied;
+    if(!Cache.IsValid())Cache=MakeShared<FCozyPreparedShapes>();
+    Cache->Update(R);return *Cache;
+}
 
 float ACozyTerrainLayout::BaselineHeight(FVector2D P) const
 {
@@ -131,13 +226,17 @@ void ACozyTerrainLayout::RebuildPreview()
     constexpr int N=65; constexpr float ChangedMeters=.05f;
     TArray<FVector> V,Normals; TArray<int32> Indices; TArray<FVector2D> UV; TArray<FLinearColor> Colors; TArray<FProcMeshTangent> Tangents;
     TArray<bool> Changed; V.Reserve(N*N); Colors.Reserve(N*N); Changed.Reserve(N*N);
+    // 자유 모양은 여기서 한 번만 준비하고 아래 반복에서 그대로 씀
+    const FCozyPreparedShapes& Now=PreparedFor(Recipe);const FCozyPreparedShapes* Old=bHasApplied?&PreparedFor(AppliedRecipe):nullptr;
+    auto SampleNow=[&](FVector2D Q){return SampleFast(Recipe,Now,Q);};
+    auto SampleOld=[&](FVector2D Q){return Old?SampleFast(AppliedRecipe,*Old,Q):BaselineHeight(Q);};
     for(int Y=0;Y<N;++Y) for(int X=0;X<N;++X)
     {
         FVector2D P((double(X)/(N-1)-.5)*Recipe.MapSize.X,(double(Y)/(N-1)-.5)*Recipe.MapSize.Y);
-        const float Z=Sample(P),Delta=Z-SampleApplied(P);
+        const float Z=SampleNow(P),Delta=Z-SampleOld(P);
         V.Add(FVector(P.X*100,P.Y*100,Z*100+15));
-        const float DX=Sample(P+FVector2D(.5,0))-Sample(P-FVector2D(.5,0));
-        const float DY=Sample(P+FVector2D(0,.5))-Sample(P-FVector2D(0,.5));
+        const float DX=SampleNow(P+FVector2D(.5,0))-SampleNow(P-FVector2D(.5,0));
+        const float DY=SampleNow(P+FVector2D(0,.5))-SampleNow(P-FVector2D(0,.5));
         Normals.Add(FVector(-DX,-DY,1).GetSafeNormal());
         UV.Add(FVector2D(double(X)/(N-1),double(Y)/(N-1)));
         FLinearColor C=Delta>=0?FLinearColor(.95,.55,.15):FLinearColor(.2,.45,.95);
@@ -194,6 +293,24 @@ bool ACozyTerrainLayout::WriteLayer(const TArray<uint16>& Data,FString& Result)
     Target->MarkPackageDirty(); return true;
 }
 
+bool ACozyTerrainLayout::BuildDelta(TArray<uint16>& Delta,FString& Result) const
+{
+    const int W=GridMax.X-GridMin.X+1,H=GridMax.Y-GridMin.Y+1;
+    if(W<2||H<2||Baseline.Num()!=W*H){Result=TEXT("연결 당시 높이 기록이 지형 범위와 맞지 않습니다. 새 설계에서 다시 연결하세요.");return false;}
+    // 자유 모양은 한 번만 준비해 모든 높이점에 씀
+    const FCozyPreparedShapes& Shapes=PreparedFor(Recipe);
+    Delta.SetNum(Baseline.Num());
+    for(int Y=0;Y<H;++Y) for(int X=0;X<W;++X)
+    {
+        FVector2D P((double(X)/(W-1)-.5)*BoundSize.X,(double(Y)/(H-1)-.5)*BoundSize.Y);
+        const float Base=((int(Baseline[Y*W+X])-32768)/128.f*CapturedTransform.GetScale3D().Z+CapturedTransform.GetLocation().Z-GetActorLocation().Z)/100;
+        const double Value=32768+(SampleFast(Recipe,Shapes,P)-Base)*100*128/CapturedTransform.GetScale3D().Z;
+        if(!FMath::IsFinite(Value)||Value<0||Value>65535){Result=TEXT("높이가 대상 지형의 표현 범위를 넘습니다. 봉우리나 기본 높이를 낮추세요.");return false;}
+        Delta[Y*W+X]=FMath::RoundToInt(Value);
+    }
+    return true;
+}
+
 bool ACozyTerrainLayout::Apply(FString& Result)
 {
     if(!GEditor||GEditor->PlayWorld||!Recipe.Validate(Result)) return false;
@@ -232,15 +349,7 @@ bool ACozyTerrainLayout::Apply(FString& Result)
         if(FMath::Abs(int(Current[I])-Expected)>3){Result=TEXT("다른 편집 레이어의 높이가 연결 당시와 달라졌습니다. 원본을 보존하기 위해 적용을 중단했습니다. 새 설계에서 다시 연결하세요.");return false;}
     }
     // 실제 원본 레이어를 덮어쓰지 않고 전용 가산 레이어에 높이 차이만 기록한다.
-    TArray<uint16> Delta;Delta.SetNum(Baseline.Num());const int W=GridMax.X-GridMin.X+1,H=GridMax.Y-GridMin.Y+1;
-    for(int Y=0;Y<H;++Y) for(int X=0;X<W;++X)
-    {
-        FVector2D P((double(X)/(W-1)-.5)*BoundSize.X,(double(Y)/(H-1)-.5)*BoundSize.Y);
-        const float Base=((int(Baseline[Y*W+X])-32768)/128.f*CapturedTransform.GetScale3D().Z+CapturedTransform.GetLocation().Z-GetActorLocation().Z)/100;
-        const double Value=32768+(Sample(P)-Base)*100*128/CapturedTransform.GetScale3D().Z;
-        if(!FMath::IsFinite(Value)||Value<0||Value>65535){Result=TEXT("높이가 대상 지형의 표현 범위를 넘습니다. 봉우리나 기본 높이를 낮추세요.");return false;}
-        Delta[Y*W+X]=FMath::RoundToInt(Value);
-    }
+    TArray<uint16> Delta;if(!BuildDelta(Delta,Result)) return false;
     FBufferArchive Backup;int32 Version=1;FGuid Guid=Target->GetLandscapeGuid();FIntPoint Min=GridMin,Max=GridMax;bool Had=Existed;
     Backup<<Version<<Guid<<Min<<Max<<Had<<Old;
     const FString Folder=FPaths::ProjectSavedDir()/TEXT("CozyTerrainEditor/Backups");IFileManager::Get().MakeDirectory(*Folder,true);
@@ -266,6 +375,25 @@ bool ACozyTerrainLayout::Apply(FString& Result)
     bHasUnappliedChanges=false;bShowPreview=false;Preview->SetVisibility(false);MarkPackageDirty();
     Result=bBakeOnApply?TEXT("지형에 굳혔습니다 · 원형 목록을 비웠습니다. 되돌리려면 '적용 전 높이 복구'. 맵 저장(Ctrl+S)은 직접 하세요.")
         :TEXT("적용 완료 · 원본 레이어 유지 · 적용 전 사본 저장됨. 맵 저장은 직접 실행하세요.");return true;
+}
+
+bool ACozyTerrainLayout::ApplyLive(FString& Result)
+{
+    // 바로 반영: 이미 만든 전용 레이어만 다시 쓴다 · 사본 파일·굳히기·되돌리기 기록 없음 (복구는 마지막 '지형에 적용' 전으로)
+    if(!IsValid(Target)||Target->GetWorld()!=GetWorld()||!Target->GetLandscapeInfo()||!EditLayerGuid.IsValid()||!Target->GetEditLayer(EditLayerGuid))
+    {Result=TEXT("먼저 '지형에 적용'으로 지형을 연결해 주세요");return false;}
+    if(!GEditor||GEditor->PlayWorld){Result=TEXT("플레이 중에는 지형에 반영하지 않습니다.");return false;}
+    if(!Recipe.Validate(Result)) return false;
+    FIntPoint Min,Max;
+    if(!Target->GetLandscapeInfo()->GetLandscapeExtent(Min.X,Min.Y,Max.X,Max.Y)||Min!=GridMin||Max!=GridMax)
+    {Result=TEXT("지형의 구획 범위가 변경됐습니다. 새 설계에서 다시 연결하세요.");return false;}
+    if(!GetActorRotation().IsNearlyZero()||!GetActorScale3D().Equals(FVector::OneVector,.001)||!Target->LandscapeActorToWorld().Equals(CapturedTransform,.01)||!GetActorLocation().Equals(BoundCenter,.01)||!Recipe.MapSize.Equals(BoundSize,.01))
+    {Result=TEXT("연결 후 영역 위치·크기 또는 대상 지형의 변환이 바뀌었습니다. 새 설계에서 다시 연결하세요.");return false;}
+    // 빠르게 자주 부르므로 다른 레이어 전체 비교(전체 읽기)는 '지형에 적용' 때만 한다
+    TArray<uint16> Delta;if(!BuildDelta(Delta,Result)||!WriteLayer(Delta,Result)) return false;
+    // 미리보기 기준만 지금 설계로 · 직전 적용분(PrevAppliedRecipe)과 사본은 그대로 두어 복구가 마지막 '지형에 적용' 전으로 돌아가게
+    AppliedRecipe=Recipe;bHasApplied=true;bHasUnappliedChanges=false;MarkPackageDirty();RebuildPreview();
+    Result=TEXT("지형에 바로 반영했습니다. 되돌리려면 '적용 전 높이 복구'(마지막 '지형에 적용' 전으로).");return true;
 }
 
 bool ACozyTerrainLayout::Restore(FString& Result)
@@ -318,6 +446,30 @@ bool ACozyTerrainLayout::SnapLandform(FCozyLandform& F) const
 {
     const FBox2D Estate=EstateBounds();
     if(!bSnapToEstateGrid||F.Type!=ECozyLandform::Plateau||CellSize<=0||!Estate.IsInside(F.Center))return false;
+    if(F.Shape==ECozyLandformShape::Free)
+    {
+        // 자유 모양: 점마다 칸 선 교차점에 맞추고 방향은 점 위치에 넣어 0도로 · 영지 층은 모서리가 각지게 모두 뾰족
+        if(F.Points.Num()<3)return false;
+        TArray<FVector2D> Corners;Corners.Reserve(F.Points.Num());
+        for(const auto& Pt:F.Points)
+        {
+            const FVector2D Rel=F.Center+Pt.Position.GetRotated(F.Rotation)-Estate.Min;
+            const FVector2D Snapped=Estate.Min+FVector2D(FMath::RoundToDouble(Rel.X/CellSize),FMath::RoundToDouble(Rel.Y/CellSize))*CellSize;
+            // 같은 교차점으로 모인 이웃 점은 하나로 (첫 점과 마지막 점도)
+            if(Corners.IsEmpty()||!Corners.Last().Equals(Snapped,1e-6))Corners.Add(Snapped);
+        }
+        if(Corners.Num()>1&&Corners[0].Equals(Corners.Last(),1e-6))Corners.Pop();
+        if(Corners.Num()<3)return false;
+        float Tier=F.Height;
+        for(int I=0;I<TierHeights.Num();++I)if(I==0||FMath::Abs(TierHeights[I]-F.Height)<FMath::Abs(Tier-F.Height))Tier=TierHeights[I];
+        const FVector2D NewCenter=CozyTerrainShape::Centroid(Corners);
+        bool bChanged=F.Rotation!=0||Tier!=F.Height||Corners.Num()!=F.Points.Num();
+        for(int I=0;!bChanged&&I<Corners.Num();++I)bChanged=!F.Points[I].bSharp||!(F.Center+F.Points[I].Position).Equals(Corners[I],1e-4);
+        TArray<FCozyShapePoint> NewPoints;NewPoints.SetNum(Corners.Num());
+        for(int I=0;I<Corners.Num();++I){NewPoints[I].Position=Corners[I]-NewCenter;NewPoints[I].bSharp=true;}
+        F.Points=MoveTemp(NewPoints);F.Center=NewCenter;F.Rotation=0;F.Height=Tier;
+        return bChanged;
+    }
     // 90·270도는 가로·세로를 바꿔 0도로 (타원은 180도 돌려도 같음)
     const int Quarter=(FMath::RoundToInt(F.Rotation/90.f)%4+4)%4;
     if(Quarter%2)F.Size=FVector2D(F.Size.Y,F.Size.X);

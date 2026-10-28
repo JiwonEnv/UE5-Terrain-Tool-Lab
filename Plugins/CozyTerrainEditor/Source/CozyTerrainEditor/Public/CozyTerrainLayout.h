@@ -3,6 +3,9 @@
 #include "GameFramework/Actor.h"
 #include "CozyTerrainLayout.generated.h"
 
+/** 자유 모양 꺾은선을 미리 만들어 둔 것 (CozyTerrainLayout.cpp 안에서만 씀) */
+struct FCozyPreparedShapes;
+
 UENUM(meta=(ScriptName="CozyLandformKind"))
 enum class ECozyLandform : uint8
 {
@@ -155,4 +158,11 @@ private:
     bool ReadTarget(TArray<uint16>& Data, FString& Result) const;
     bool WriteLayer(const TArray<uint16>& Data, FString& Result);
     FString PresetPath() const;
+    /** 자유 모양 꺾은선 캐시 (지금 설계용·적용분용) · 점이 바뀐 평지·산만 다시 만든다 */
+    mutable TSharedPtr<FCozyPreparedShapes> PreparedNow;
+    mutable TSharedPtr<FCozyPreparedShapes> PreparedApplied;
+    const FCozyPreparedShapes& PreparedFor(const FCozyTerrainRecipe& R) const;
+    float SampleFast(const FCozyTerrainRecipe& R, const FCozyPreparedShapes& Shapes, FVector2D LocalMeters) const;
+    /** 지금 설계 높이 − 연결 당시 원래 높이 → 전용 가산 레이어 값 (적용·바로 반영 공통) */
+    bool BuildDelta(TArray<uint16>& Delta, FString& Result) const;
 };

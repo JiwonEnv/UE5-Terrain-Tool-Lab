@@ -67,6 +67,120 @@ bool FCozyTerrainSnapTest::RunTest(const FString&)
     TestEqual(TEXT("영지 밖 높이 유지"),Outside.Height,3.f);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainFreeShapeTest,"CozyRealm.TerrainEditor.FreeShapeAndSlope",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyTerrainFreeShapeTest::RunTest(const FString&)
+{
+    // 한 변 20m 정사각형 (모두 뾰족 → 꺾은선이 조절점 다각형과 같음)
+    auto Square=[](ECozyLandform Type,float Height){FCozyLandform F;F.Type=Type;F.Shape=ECozyLandformShape::Free;F.Height=Height;F.Blend=4;
+        for(const FVector2D& P:{FVector2D(-10,-10),FVector2D(10,-10),FVector2D(10,10),FVector2D(-10,10)}){FCozyShapePoint Pt;Pt.Position=P;Pt.bSharp=true;F.Points.Add(Pt);}return F;};
+    auto Near=[](float A,float B,float Tol){return FMath::Abs(A-B)<=Tol;};
+    FString Error;
+    // 자유 모양 평지 · 연결 폭
+    FCozyTerrainRecipe Flat;Flat.Landforms.Add(Square(ECozyLandform::Plateau,6));
+    TestTrue(TEXT("자유 모양 설정 유효"),Flat.Validate(Error));
+    TestTrue(TEXT("자유 평지 안 목표 높이"),Near(Flat.Evaluate(FVector2D(0,0),0),6,1e-4f)&&Near(Flat.Evaluate(FVector2D(7,-9),0),6,1e-4f));
+    TestTrue(TEXT("자유 평지 연결 폭 사이"),Flat.Evaluate(FVector2D(12,0),0)>0&&Flat.Evaluate(FVector2D(12,0),0)<6);
+    TestEqual(TEXT("자유 평지 멀리 밖은 그대로"),Flat.Evaluate(FVector2D(30,0),0),0.f);
+    // 경사 각도 45도 평지: 올릴 때·내릴 때
+    Flat.Landforms[0].EdgeMode=ECozyEdgeMode::Angle;Flat.Landforms[0].SlopeAngle=45;
+    TestTrue(TEXT("45도 비탈 2m 밖은 6-2"),Near(Flat.Evaluate(FVector2D(12,0),0),4,.05f));
+    TestTrue(TEXT("45도 비탈 안은 목표 높이"),Near(Flat.Evaluate(FVector2D(3,3),0),6,1e-4f));
+    TestTrue(TEXT("45도 비탈이 주변 높이에서 멈춤"),Near(Flat.Evaluate(FVector2D(20,0),0),0,1e-4f));
+    TestTrue(TEXT("내리는 평지: 2m 밖은 6+2"),Near(Flat.Evaluate(FVector2D(12,0),10),8,.05f));
+    TestTrue(TEXT("내리는 평지: 멀면 주변 높이, 안은 목표"),Near(Flat.Evaluate(FVector2D(20,0),10),10,1e-4f)&&Near(Flat.Evaluate(FVector2D(0,0),10),6,1e-4f));
+    // 타원 평지 경사 각도 (짧은 반지름으로 근사 · 원이면 정확)
+    FCozyTerrainRecipe Round;FCozyLandform Disc;Disc.Size=FVector2D(20,20);Disc.Height=6;Disc.EdgeMode=ECozyEdgeMode::Angle;Disc.SlopeAngle=45;Round.Landforms.Add(Disc);
+    TestTrue(TEXT("원 평지 45도 2m 밖은 4"),Near(Round.Evaluate(FVector2D(12,0),0),4,.05f));
+    // 자유 모양 산 · 경사 각도: 테두리가 산기슭, 안쪽 깊이×tan, 높이에 닿으면 평평
+    FCozyTerrainRecipe Hill;Hill.Landforms.Add(Square(ECozyLandform::Mountain,5));Hill.Landforms[0].EdgeMode=ECozyEdgeMode::Angle;Hill.Landforms[0].SlopeAngle=45;
+    TestTrue(TEXT("각도 산 깊이 2m는 2m"),Near(Hill.Evaluate(FVector2D(-8,0),0),2,.05f));
+    TestTrue(TEXT("각도 산 깊이 3m는 3m"),Near(Hill.Evaluate(FVector2D(7,7),0),3,.05f));
+    TestTrue(TEXT("각도 산 평평한 꼭대기"),Near(Hill.Evaluate(FVector2D(0,0),0),5,1e-3f)&&Near(Hill.Evaluate(FVector2D(2,-3),0),5,1e-3f));
+    TestTrue(TEXT("각도 산 밖은 0"),Near(Hill.Evaluate(FVector2D(15,0),0),0,1e-4f));
+    Hill.Landforms[0].SlopeAngle=30;
+    TestTrue(TEXT("각도 산 30도 깊이 2m"),Near(Hill.Evaluate(FVector2D(-8,0),0),2*FMath::Tan(FMath::DegreesToRadians(30.f)),.05f));
+    // 자유 모양 산 · 연결 폭: 가장 깊은 곳이 가장 높고 바깥으로 낮아짐
+    FCozyTerrainRecipe Peak;Peak.Landforms.Add(Square(ECozyLandform::Mountain,20));
+    const float H0=Peak.Evaluate(FVector2D(0,0),0),H5=Peak.Evaluate(FVector2D(5,0),0),H10=Peak.Evaluate(FVector2D(10,0),0),H20=Peak.Evaluate(FVector2D(20,0),0);
+    TestTrue(TEXT("폭 산 가장 깊은 곳은 거의 높이"),Near(H0,20,.5f));
+    TestTrue(TEXT("폭 산 바깥으로 낮아짐"),H0>H5&&H5>H10&&H10>H20&&H20>=0);
+    TestTrue(TEXT("폭 산 멀리는 0"),Near(Peak.Evaluate(FVector2D(80,0),0),0,1e-3f));
+    // 검사
+    FCozyTerrainRecipe Bad=Flat;Bad.Landforms[0].Points.SetNum(2);
+    TestFalse(TEXT("점 2개 자유 모양 거부"),Bad.Validate(Error));
+    Bad=Flat;Bad.Landforms[0].Points[1].Position.X=1e10;
+    TestFalse(TEXT("범위 밖 점 위치 거부"),Bad.Validate(Error));
+    Bad=Flat;Bad.Landforms[0].SlopeAngle=89;
+    TestFalse(TEXT("경사 각도 범위 밖 거부"),Bad.Validate(Error));
+    // 옛 설정 파일(새 항목 없음)도 그대로 열림
+    const FString OldJson=TEXT("{\"version\":1,\"mapSize\":{\"x\":252,\"y\":252},\"components\":4,\"baseHeight\":0,\"landforms\":[{\"name\":\"a\",\"type\":\"Plateau\",\"center\":{\"x\":0,\"y\":0},\"size\":{\"x\":40,\"y\":30},\"height\":5,\"blend\":8,\"rotation\":0,\"peakFlat\":0}],\"routes\":[]}");
+    FCozyTerrainRecipe Old;
+    TestTrue(TEXT("옛 설정 파일 읽기"),FJsonObjectConverter::JsonObjectStringToUStruct(OldJson,&Old,0,0));
+    TestTrue(TEXT("옛 설정은 타원·연결 폭"),Old.Validate(Error)&&Old.Landforms.Num()==1&&Old.Landforms[0].Shape==ECozyLandformShape::Ellipse&&Old.Landforms[0].EdgeMode==ECozyEdgeMode::Width);
+    TestEqual(TEXT("옛 설정 높이"),Old.Evaluate(FVector2D(0,0),0),5.f);
+    // 자유 모양 저장·복원
+    FString Json;FJsonObjectConverter::UStructToJsonObjectString(Hill,Json);FCozyTerrainRecipe Back;
+    TestTrue(TEXT("자유 모양 저장·복원"),FJsonObjectConverter::JsonObjectStringToUStruct(Json,&Back,0,0)&&Back.Landforms.Num()==1&&Back.Landforms[0].Points.Num()==4&&Back.Evaluate(FVector2D(-8,0),0)==Hill.Evaluate(FVector2D(-8,0),0));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainLegacyEllipseTest,"CozyRealm.TerrainEditor.LegacyEllipseUnchanged",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyTerrainLegacyEllipseTest::RunTest(const FString&)
+{
+    // 자유 모양 이전의 타원 계산식 (길 제외) · 타원+연결 폭 결과가 그대로인지 비교
+    auto Legacy=[](const FCozyTerrainRecipe& R,FVector2D P,float Base)
+    {
+        auto SmoothMax=[](float A,float B){const float K=FMath::Min(4.f,.25f*FMath::Max(A,B));if(K<=KINDA_SMALL_NUMBER)return FMath::Max(A,B);const float W=FMath::Max(K-FMath::Abs(A-B),0.f)/K;return FMath::Max(A,B)+W*W*K*.25f;};
+        float Up=0,Down=0;
+        for(const auto& F:R.Landforms)
+        {
+            if(F.Type!=ECozyLandform::Mountain) continue;
+            const FVector2D Q=(P-F.Center).GetRotated(-F.Rotation);
+            const double D=FMath::Sqrt(FMath::Square(Q.X/FMath::Max(1.,F.Size.X*.5))+FMath::Square(Q.Y/FMath::Max(1.,F.Size.Y*.5)));
+            const double T=FMath::Clamp(F.PeakFlat,0.f,90.f)/100.,Rr=FMath::Max(0.,D-T)/(1-T);
+            const float Bump=F.Height*FMath::Exp(-2*Rr*Rr);
+            if(Bump>=0)Up=SmoothMax(Up,Bump);else Down=-SmoothMax(-Down,-Bump);
+        }
+        float H=Base+Up+Down;
+        for(const auto& F:R.Landforms)
+        {
+            if(F.Type==ECozyLandform::Mountain) continue;
+            const FVector2D Q=(P-F.Center).GetRotated(-F.Rotation);
+            const double D=FMath::Sqrt(FMath::Square(Q.X/FMath::Max(1.,F.Size.X*.5))+FMath::Square(Q.Y/FMath::Max(1.,F.Size.Y*.5)));
+            H=FMath::Lerp(H,F.Height,float(1-FMath::SmoothStep(1.,1.+F.Blend/FMath::Max(1.,FMath::Min(F.Size.X,F.Size.Y)*.5),D)));
+        }
+        return H;
+    };
+    FCozyTerrainRecipe R;
+    FCozyLandform A;A.Type=ECozyLandform::Mountain;A.Center=FVector2D(10,20);A.Size=FVector2D(120,70);A.Height=40;A.Rotation=30;A.PeakFlat=25;R.Landforms.Add(A);
+    FCozyLandform B;B.Type=ECozyLandform::Mountain;B.Center=FVector2D(-30,-10);B.Size=FVector2D(50,50);B.Height=-12;R.Landforms.Add(B);
+    FCozyLandform C;C.Center=FVector2D(-20,30);C.Size=FVector2D(40,24);C.Height=8;C.Blend=10;C.Rotation=-20;R.Landforms.Add(C);
+    float Worst=0;
+    for(int Y=-6;Y<=6;++Y)for(int X=-6;X<=6;++X){const FVector2D P(X*13.7,Y*11.3);Worst=FMath::Max(Worst,FMath::Abs(R.Evaluate(P,3)-Legacy(R,P,3)));}
+    TestTrue(TEXT("타원·연결 폭 결과가 이전과 같음"),Worst<1e-4f);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainFreeSnapTest,"CozyRealm.TerrainEditor.FreeShapeEstateSnap",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyTerrainFreeSnapTest::RunTest(const FString&)
+{
+    // 기본값: 영지 중심 0,0 · 12×12칸 · 2m · 층 0/2.4/4.8m
+    const ACozyTerrainLayout* Plan=GetDefault<ACozyTerrainLayout>();
+    FCozyLandform F;F.Shape=ECozyLandformShape::Free;F.Center=FVector2D(1,1);F.Rotation=90;F.Height=3;
+    for(const FVector2D& P:{FVector2D(-3.1,-2.9),FVector2D(3.2,-3),FVector2D(2.9,3.1),FVector2D(-3,2.8)}){FCozyShapePoint Pt;Pt.Position=P;F.Points.Add(Pt);}
+    TestTrue(TEXT("영지 안 자유 평지 맞춤"),Plan->SnapLandform(F));
+    TestEqual(TEXT("방향 0도"),F.Rotation,0.f);
+    TestEqual(TEXT("가장 가까운 층 높이"),F.Height,2.4f);
+    TestEqual(TEXT("점 수 유지"),F.Points.Num(),4);
+    bool bGrid=true,bSharp=true;
+    for(const auto& Pt:F.Points){const FVector2D W=F.Center+Pt.Position;bGrid&=FMath::Abs(W.X/2-FMath::RoundToDouble(W.X/2))<1e-4&&FMath::Abs(W.Y/2-FMath::RoundToDouble(W.Y/2))<1e-4;bSharp&=Pt.bSharp;}
+    TestTrue(TEXT("점이 2m 칸 교차점 위"),bGrid);
+    TestTrue(TEXT("모서리 모두 뾰족"),bSharp);
+    // 90도 돌린 첫 점 (-3.1,-2.9) → (2.9,-3.1)+중심(1,1) = (3.9,-2.1) → (4,-2)
+    TestTrue(TEXT("돌린 방향이 점에 들어감"),(F.Center+F.Points[0].Position).Equals(FVector2D(4,-2),1e-4));
+    TestFalse(TEXT("이미 맞춘 모양은 다시 바뀌지 않음"),Plan->SnapLandform(F));
+    FCozyLandform Far=F;Far.Center=FVector2D(50,50);Far.Height=3;
+    TestFalse(TEXT("영지 밖 자유 평지는 자유"),Plan->SnapLandform(Far));
+    return true;
+}
 // 별도 검증 프로세스에서만 새 임시 맵을 만든다. 일반 전체 검사에서는 현재 맵을 건드리지 않는다.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyTerrainLandscapeTest,"CozyRealm.TerrainEditor.LandscapeApplyRestore",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
 bool FCozyTerrainLandscapeTest::RunTest(const FString&)
@@ -93,6 +207,22 @@ bool FCozyTerrainLandscapeTest::RunTest(const FString&)
     TestTrue(TEXT("높이 18m 실제 반영"),FMath::Abs(Height()-1800)<3);
     TestTrue(TEXT("마지막 적용 전 높이 복구"),Plan->Restore(Result));
     TestTrue(TEXT("복구된 높이 12m"),FMath::Abs(Height()-1200)<3);
+    // 바로 반영: 연결 전에는 거부 · 연결 뒤에는 사본 없이 레이어만 다시 쓰고, 복구는 마지막 '지형에 적용' 전으로
+    {
+        auto* Fresh=World->SpawnActor<ACozyTerrainLayout>();
+        TestFalse(TEXT("연결 전 바로 반영 거부"),Fresh->ApplyLive(Result));World->DestroyActor(Fresh);
+        const FString Backup=Plan->LastBackup;
+        Plan->Recipe.Landforms[0].Height=15;
+        if(!TestTrue(TEXT("바로 반영"),Plan->ApplyLive(Result))){AddError(Result);return false;}
+        TestTrue(TEXT("바로 반영 높이 15m"),FMath::Abs(Height()-1500)<3);
+        TestEqual(TEXT("바로 반영은 레이어를 늘리지 않음"),Target->GetLayersConst().Num(),LayerCount);
+        TestEqual(TEXT("바로 반영은 사본을 만들지 않음"),Plan->LastBackup,Backup);
+        TestEqual(TEXT("바로 반영은 원형을 비우지 않음"),Plan->Recipe.Landforms.Num(),1);
+        TestTrue(TEXT("바로 반영 뒤 미리보기 기준도 지금 설계"),FMath::Abs(Plan->SampleApplied(FVector2D::ZeroVector)-15)<.05);
+        TestTrue(TEXT("바로 반영 뒤 복구"),Plan->Restore(Result));
+        TestTrue(TEXT("복구하면 마지막 적용 전 12m"),FMath::Abs(Height()-1200)<3);
+        Plan->Recipe.Landforms[0].Height=18;
+    }
     auto* Connected=World->SpawnActor<ACozyTerrainLayout>();Connected->bBakeOnApply=false;
     TestTrue(TEXT("기존 Landscape 높이를 기준으로 연결"),Connected->BindLandscape(Target,Result));
     TestTrue(TEXT("연결된 원래 높이 읽기"),FMath::Abs(Connected->Sample(FVector2D::ZeroVector)-12)<.03);
