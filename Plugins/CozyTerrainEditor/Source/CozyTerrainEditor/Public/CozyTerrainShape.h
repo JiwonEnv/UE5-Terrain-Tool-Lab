@@ -31,4 +31,14 @@ namespace CozyTerrainShape
     COZYTERRAINEDITOR_API int32 FindSpan(const FCozyPolyShape& Shape, FVector2D P, float MaxDistance);
     /** 조절점들의 무게중심 (새 자유 모양의 중심을 정할 때) */
     COZYTERRAINEDITOR_API FVector2D Centroid(const TArray<FVector2D>& Points);
+
+    // ---- 랜덤 (띠·울퉁불퉁 단계 · 작업 3) ----
+    /** 같은 씨앗이면 항상 같은 값인 부드러운 2D 잡음 · 대략 -1~1 · Size(m)는 한 덩어리 크기 (여러 겹 합친 펄린 잡음) */
+    COZYTERRAINEDITOR_API float Noise2D(FVector2D P, float Size, int32 Seed);
+    /** 꺾은선 테두리를 구불구불하게: 간격 Size/6 이하로 다시 나눈 뒤 각 꼭짓점을 바깥 방향으로 잡음×Amount만큼 민다 (BuildPolyline 뒤, Prepare 전에 부름)
+     *  Span은 유지 · Amount<=0이면 아무것도 안 함 · 모양 위치에 대해 결정적(같은 입력 → 같은 결과) */
+    COZYTERRAINEDITOR_API void ApplyEdgeJitter(FCozyPolyShape& Shape, float Amount, float Size, int32 Seed);
+    /** 바깥 모양 안쪽에 띠 Count개를 무작위로 만든다 · 씨앗으로 정한 꼭대기 쪽으로 치우치며 안으로 줄어들고, 서로 겹치지 않게 차례로 안쪽에 놓인다
+     *  높이는 PeakHeight를 Count+1로 나눠 고르게(1/(Count+1) … Count/(Count+1)) · 점은 바깥 모양과 같은 기준(중심 기준 m) */
+    COZYTERRAINEDITOR_API void GenerateBands(const TArray<FCozyShapePoint>& Outline, int32 Count, float PeakHeight, int32 Seed, TArray<FCozyContourBand>& OutBands);
 }

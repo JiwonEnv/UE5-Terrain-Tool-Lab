@@ -38,6 +38,16 @@ struct FCozyShapePoint
     UPROPERTY(EditAnywhere, meta=(DisplayName="뾰족한 모서리")) bool bSharp=false;
 };
 
+/** 산 안쪽 띠(등고선) · 자유 모양 산에만 · 점은 산 중심 기준 미터(회전 전) · 이 띠 위의 높이가 Height */
+USTRUCT()
+struct FCozyContourBand
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere, meta=(DisplayName="띠 점")) TArray<FCozyShapePoint> Points;
+    /** 산기슭(바깥 모양)이 0m일 때 이 띠의 높이 */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="띠 높이 (m)",ClampMin="-200",ClampMax="200")) float Height=10;
+};
+
 USTRUCT()
 struct FCozyLandform
 {
@@ -58,6 +68,17 @@ struct FCozyLandform
     /** 연결 폭: 주변 연결 폭(m) 안에서 부드럽게 이어짐 · 경사 각도: 정한 각도의 곧은 비탈 */
     UPROPERTY(EditAnywhere, meta=(DisplayName="가장자리 방식")) ECozyEdgeMode EdgeMode=ECozyEdgeMode::Width;
     UPROPERTY(EditAnywhere, meta=(DisplayName="경사 각도 (도)",ClampMin="5",ClampMax="85")) float SlopeAngle=45;
+    /** 자유 모양 산의 안쪽 띠 · 비어 있으면 지금처럼 바깥 모양을 따라 고르게 · 있으면 띠와 띠 사이를 부드럽게 잇고, 가장 안쪽 띠 안은 Height(꼭대기)까지 오른다 */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="안쪽 띠")) TArray<FCozyContourBand> Bands;
+    /** 랜덤: 표면 울퉁불퉁 세기(m) · 0이면 없음 */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="울퉁불퉁 세기 (m)",ClampMin="0",ClampMax="30")) float NoiseAmount=0;
+    /** 울퉁불퉁 한 덩어리 크기(m) */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="울퉁불퉁 크기 (m)",ClampMin="2",ClampMax="300")) float NoiseSize=30;
+    /** 랜덤: 테두리·띠 선이 구불구불한 정도(m) · 0이면 없음 */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="테두리 들쭉날쭉 (m)",ClampMin="0",ClampMax="30")) float EdgeJitter=0;
+    UPROPERTY(EditAnywhere, meta=(DisplayName="들쭉날쭉 간격 (m)",ClampMin="2",ClampMax="200")) float EdgeJitterSize=15;
+    /** 랜덤 씨앗 · 바꾸면 같은 세기로 다른 모양 ('다시 섞기') */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="랜덤 씨앗")) int32 RandomSeed=1;
 };
 
 USTRUCT()
