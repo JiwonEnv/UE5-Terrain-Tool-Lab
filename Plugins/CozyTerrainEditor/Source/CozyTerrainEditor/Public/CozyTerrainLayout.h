@@ -10,6 +10,31 @@ enum class ECozyLandform : uint8
     Mountain UMETA(DisplayName="산·능선")
 };
 
+/** 평지·산의 바닥 모양 */
+UENUM(meta=(ScriptName="CozyLandformShape"))
+enum class ECozyLandformShape : uint8
+{
+    Ellipse UMETA(DisplayName="원·타원"),
+    Free UMETA(DisplayName="자유 모양")
+};
+
+/** 가장자리를 정하는 방식 */
+UENUM(meta=(ScriptName="CozyEdgeMode"))
+enum class ECozyEdgeMode : uint8
+{
+    Width UMETA(DisplayName="연결 폭"),
+    Angle UMETA(DisplayName="경사 각도")
+};
+
+/** 자유 모양의 점 · 위치는 중심 기준 미터(회전 전) · 뾰족하면 그 점에서 꺾이고, 아니면 부드러운 곡선으로 지난다 */
+USTRUCT()
+struct FCozyShapePoint
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere, meta=(DisplayName="위치 (m)")) FVector2D Position=FVector2D::ZeroVector;
+    UPROPERTY(EditAnywhere, meta=(DisplayName="뾰족한 모서리")) bool bSharp=false;
+};
+
 USTRUCT()
 struct FCozyLandform
 {
@@ -23,6 +48,13 @@ struct FCozyLandform
     UPROPERTY(EditAnywhere, meta=(DisplayName="방향 (도)")) float Rotation=0;
     /** 산만: 꼭대기가 평평하게 넓은 정도 · 0%는 뾰족한 봉우리, 클수록 윗부분이 넓고 옆면이 가파름 */
     UPROPERTY(EditAnywhere, meta=(DisplayName="꼭대기 넓이 (%)",ClampMin="0",ClampMax="90")) float PeakFlat=0;
+    /** 원·타원은 가로·세로(Size)로, 자유 모양은 점(Points)으로 바닥 모양을 정한다 */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="모양")) ECozyLandformShape Shape=ECozyLandformShape::Ellipse;
+    /** 자유 모양의 점 (3개 이상 · 닫힌 모양) */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="모양 점")) TArray<FCozyShapePoint> Points;
+    /** 연결 폭: 주변 연결 폭(m) 안에서 부드럽게 이어짐 · 경사 각도: 정한 각도의 곧은 비탈 */
+    UPROPERTY(EditAnywhere, meta=(DisplayName="가장자리 방식")) ECozyEdgeMode EdgeMode=ECozyEdgeMode::Width;
+    UPROPERTY(EditAnywhere, meta=(DisplayName="경사 각도 (도)",ClampMin="5",ClampMax="85")) float SlopeAngle=45;
 };
 
 USTRUCT()
@@ -67,6 +99,8 @@ public:
     UPROPERTY(EditAnywhere, Category="02 표시", meta=(DisplayName="등고선 간격 (m)",ClampMin="0.5",ClampMax="50")) float ContourInterval=5;
     /** 켜 두면 적용할 때 평지·산·길 원형을 지형에 굳히고 목록을 비운다 (복구하면 원형이 돌아옴) */
     UPROPERTY(EditAnywhere, Category="02 표시", meta=(DisplayName="적용하면 원형 정리")) bool bBakeOnApply=true;
+    /** 켜 두면 값을 바꿀 때마다 지형에 바로 반영 (사본·굳히기 없이 · 먼저 한 번 '지형에 적용'으로 지형을 연결해야 함) */
+    UPROPERTY(EditAnywhere, Category="02 표시", meta=(DisplayName="바로 반영")) bool bLiveApply=false;
     UPROPERTY(EditAnywhere, Category="03 재사용", meta=(DisplayName="저장·불러올 설정 이름")) FString PresetName=TEXT("지형설정_01");
     UPROPERTY(EditAnywhere, Category="04 재질", meta=(DisplayName="적용할 지면 재질 (선택)")) TObjectPtr<class UMaterialInterface> GroundMaterial;
     UPROPERTY(VisibleAnywhere, Category="05 적용 대상", meta=(DisplayName="선택한 Landscape")) TObjectPtr<class ALandscape> Target;
@@ -104,6 +138,8 @@ public:
     void RebuildPreview();
     bool BindLandscape(ALandscape* Landscape, FString& Result);
     bool Apply(FString& Result);
+    /** 바로 반영용 가벼운 적용: 이미 연결된 지형의 전용 레이어만 다시 쓴다 · 사본 파일·굳히기를 만들지 않는다 · 연결 전이면 false와 이유 */
+    bool ApplyLive(FString& Result);
     bool Restore(FString& Result);
     bool SavePreset(FString& Result) const;
     bool LoadPreset(FString& Result);
