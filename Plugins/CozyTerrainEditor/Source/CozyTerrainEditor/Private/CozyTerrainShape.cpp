@@ -262,16 +262,17 @@ namespace CozyTerrainShape
         if(!Outer.IsValid()||Outer.MaxInset<=0) return;
         FRandomStream Rng(Seed);
 
-        // 1) 꼭대기 C: 범위 안 후보 40개(못 찾으면 더) 중 '무작위 + 깊이(가장 깊은 곳의 35% 이상이면 만점)' 점수가 가장 높은 곳
-        const double Deep=0.35*Outer.MaxInset;
+        // 1) 꼭대기 C: 범위 안 후보 40개(못 찾으면 더) 중 '무작위 + 깊이(가장 깊은 곳의 60% 이상이면 만점)' 점수가 가장 높은 곳
+        //    테두리 가까이(가장 깊은 곳의 30% 미만)는 처음 200번은 후보에서 뺀다 (꼭대기가 가장자리에 붙어 한쪽 비탈이 급해지던 문제)
+        const double Deep=0.6*Outer.MaxInset, Shallow=0.3*Outer.MaxInset;
         FVector2D C=FVector2D::ZeroVector; double BestScore=-1;
         for(int32 Try=0;Try<400&&(Try<40||BestScore<0);++Try)
         {
             const FVector2D P(Rng.FRandRange(Outer.Bounds.Min.X,Outer.Bounds.Max.X),Rng.FRandRange(Outer.Bounds.Min.Y,Outer.Bounds.Max.Y));
             const double Luck=Rng.FRand();
             const double D=-double(SignedDistance(Outer,P));
-            if(D<=0) continue;
-            const double Score=Luck+2.0*FMath::Min(D/Deep,1.0);
+            if(D<=0||(D<Shallow&&Try<200)) continue;
+            const double Score=0.6*Luck+3.0*FMath::Min(D/Deep,1.0);
             if(Score>BestScore){ BestScore=Score; C=P; }
         }
         if(BestScore<0) return;

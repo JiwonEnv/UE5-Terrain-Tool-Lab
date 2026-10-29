@@ -332,4 +332,24 @@ bool FCozyShapeBandsTest::RunTest(const FString&)
     TestEqual(TEXT("한 자리 점 → 띠 없음"),E.Num(),0);
     return true;
 }
+
+// 띠 자동 만들기의 꼭대기가 테두리에 붙지 않는지 (가장 안쪽 띠 무게중심 깊이 ≥ 가장 깊은 곳의 25%)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCozyShapeBandsPeakInsideTest,"CozyRealm.TerrainEditor.Shape.BandsPeakInside",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCozyShapeBandsPeakInsideTest::RunTest(const FString&)
+{
+    TArray<FCozyShapePoint> Outline;
+    for(const FVector2D& V:{FVector2D(-40,-30),FVector2D(35,-35),FVector2D(45,10),FVector2D(10,40),FVector2D(-35,30)}){FCozyShapePoint Pt;Pt.Position=V;Outline.Add(Pt);}
+    FCozyPolyShape Outer; CozyTerrainShape::BuildPolyline(Outline,8,Outer); CozyTerrainShape::Prepare(Outer);
+    int32 Good=0;
+    for(int32 Seed=1;Seed<=10;++Seed)
+    {
+        TArray<FCozyContourBand> Bands; CozyTerrainShape::GenerateBands(Outline,3,30.f,Seed,Bands);
+        if(Bands.Num()!=3) continue;
+        TArray<FVector2D> P; for(const FCozyShapePoint& Pt:Bands.Last().Points) P.Add(Pt.Position);
+        const float Depth=-CozyTerrainShape::SignedDistance(Outer,CozyTerrainShape::Centroid(P));
+        if(Depth>=0.25f*Outer.MaxInset) ++Good;
+    }
+    TestEqual(TEXT("씨앗 10개 모두 꼭대기가 안쪽"),Good,10);
+    return true;
+}
 #endif
