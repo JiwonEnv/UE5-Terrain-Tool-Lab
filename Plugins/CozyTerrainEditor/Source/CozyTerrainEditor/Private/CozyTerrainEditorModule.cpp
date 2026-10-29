@@ -13,6 +13,7 @@
 #include "IDetailsView.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/SCompoundWidget.h"
+#include "Widgets/SOverlay.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SBox.h"
@@ -55,6 +56,10 @@ static FCozyPolyShape LinePoly(const FCozyLandform& F,int Band)
 }
 // 높이 글자: 정수면 "10m", 아니면 "12.5m"
 static FString MetersText(float V){return FMath::IsNearlyEqual(V,FMath::RoundToFloat(V),.05f)?FString::Printf(TEXT("%.0fm"),V):FString::Printf(TEXT("%.1fm"),V);}
+// 지도 확대·옮기기: Zoom 1 = 지도 전체 · Center = 화면 가운데에 오는 지도 위치 (m) · 편집기 창은 하나라 하나만 둠
+struct FMapView{double Zoom=1;FVector2D Center=FVector2D::ZeroVector;};
+static FMapView MapView;
+static void ResetView(){MapView=FMapView();}
 class SPanel;
 class SMap : public SLeafWidget
 {
@@ -73,6 +78,14 @@ public:
     virtual void OnMouseCaptureLost(const FCaptureLostEvent&) override;
     virtual bool SupportsKeyboardFocus() const override{return true;}
     virtual FReply OnKeyDown(const FGeometry&,const FKeyEvent&) override;
+    virtual FReply OnKeyUp(const FGeometry&,const FKeyEvent& E) override{if(E.GetKey()==EKeys::SpaceBar){bSpace=false;return FReply::Handled();}return FReply::Unhandled();}
+    virtual void OnFocusLost(const FFocusEvent&) override{bSpace=false;}
+    virtual FReply OnMouseWheel(const FGeometry&,const FPointerEvent&) override;
+    virtual FCursorReply OnCursorQuery(const FGeometry&,const FPointerEvent&) const override{return bPan?FCursorReply::Cursor(EMouseCursor::GrabHandClosed):bSpace?FCursorReply::Cursor(EMouseCursor::GrabHand):FCursorReply::Unhandled();}
+    // 지도 옮기기: 가운데 버튼(또는 Space+왼쪽) 끌기
+    bool bPan=false,bSpace=false;FKey PanButton;FVector2D PanLast=FVector2D::ZeroVector;
+    /** 마우스로 끈 픽셀만큼 지도를 옮김 */
+    void PanPixels(const FVector2D& Size,const FVector2D& Span,FVector2D Delta);
     TUniquePtr<FScopedTransaction> Drag;
     bool bResize=false;
     // 평지·산 추가: 누른 곳에서 끈 범위로 만든다
@@ -101,6 +114,7 @@ public:
     TWeakObjectPtr<UWorld> LastWorld;
     TSharedPtr<IDetailsView> Details;
     TSharedPtr<SMap> Map;
+    TSharedPtr<SScrollBox> RightScroll;
     // 오른쪽 요소 목록 (0 이상 = 평지·산 번호 · 음수 = -1-길 번호)
     TArray<TSharedPtr<int32>> Items;
     TSharedPtr<SListView<TSharedPtr<int32>>> List;
@@ -260,14 +274,14 @@ public:
     void LoadExisting()
     {
         auto* W=GEditor->GetEditorWorldContext().World();
-        for(TActorIterator<ACozyTerrainLayout> It(W);It;++It){Plan=*It;SelectNone();Message(TEXT("현재 레벨의 저장된 설계를 열었습니다."));return;}
+        for(TActorIterator<ACozyTerrainLayout> It(W);It;++It){Plan=*It;SelectNone();ResetView();Message(TEXT("현재 레벨의 저장된 설계를 열었습니다."));return;}
         Message(TEXT("저장된 설계가 없습니다. 새 설계를 눌러 시작하세요."));
     }
     void NewPlan()
     {
         if(GEditor->PlayWorld){Message(TEXT("플레이를 종료한 뒤 편집하세요."));return;}
         const FScopedTransaction Tx(T(TEXT("새 지형 설계")));
-        auto* P=GEditor->GetEditorWorldContext().World()->SpawnActor<ACozyTerrainLayout>();P->SetFlags(RF_Transactional);P->SetActorLabel(TEXT("지형 설계"));P->SetFolderPath(TEXT("지형 편집기/설계"));Plan=P;SelectNone();Message(TEXT("새 설계 · 왼쪽 도구를 고른 뒤 지도에 클릭하세요."));
+        auto* P=GEditor->GetEditorWorldContext().World()->SpawnActor<ACozyTerrainLayout>();P->SetFlags(RF_Transactional);P->SetActorLabel(TEXT("지형 설계"));P->SetFolderPath(TEXT("지형 편집기/설계"));Plan=P;SelectNone();ResetView();Message(TEXT("새 설계 · 왼쪽 도구를 고른 뒤 지도에 클릭하세요."));
     }
     void BindSelected()
     {
@@ -337,9 +351,16 @@ public:
                 // 바로 반영: 값을 바꾸고 잠시 뒤 지형에 반영 (원형 정리·사본 없이)
                 +SVerticalBox::Slot().AutoHeight().Padding(5)[SNew(SCheckBox).IsChecked_Lambda([this](){auto* P=GetPlan();return P&&P->bLiveApply?ECheckBoxState::Checked:ECheckBoxState::Unchecked;}).OnCheckStateChanged_Lambda([this](ECheckBoxState S){if(auto* P=GetPlan()){P->Modify();P->bLiveApply=S==ECheckBoxState::Checked;P->MarkPackageDirty();LiveNote.Reset();if(P->bLiveApply)LiveDue=FPlatformTime::Seconds();else LiveDue=0;}})
                     .ToolTipText(T(TEXT("값을 바꾸면 지형에 바로 반영 · 먼저 한 번 '지형에 적용'이 필요")))[SNew(STextBlock).Text_Lambda([this](){return FText::FromString(LiveNote.IsEmpty()?FString(TEXT("바로 반영")):FString::Printf(TEXT("바로 반영  (%s)"),*LiveNote));})]]
-                +SVerticalBox::Slot().AutoHeight().Padding(5)[SNew(STextBlock).AutoWrapText(true).Text(T(TEXT("청록 낮음\n노랑 높음\n빨강 급경사\n사각 손잡이 = 크기\n자유 모양 점: 네모 = 뾰족 · 동그라미 = 둥글게 (오른쪽 클릭으로 바꿈) · 테두리 더블클릭 = 점 추가\n주황 선 = 산 안쪽 띠 (눌러 고름)")))]]
-            +SSplitter::Slot().Value(.53f)[SAssignNew(Map,SMap,SharedThis(this))]
-            +SSplitter::Slot().Value(.32f)[SNew(SVerticalBox)
+                +SVerticalBox::Slot().AutoHeight().Padding(5)[SNew(STextBlock).AutoWrapText(true).Text(T(TEXT("청록 낮음\n노랑 높음\n빨강 급경사\n사각 손잡이 = 크기\n자유 모양 점: 네모 = 뾰족 · 동그라미 = 둥글게 (오른쪽 클릭으로 바꿈) · 테두리 더블클릭 = 점 추가\n주황 선 = 산 안쪽 띠 (눌러 고름)\n휠 = 지도 확대·축소 · 가운데 버튼 끌기(또는 Space+끌기) = 지도 옮기기 · Home·가운데 버튼 더블클릭 = 전체 보기 · 확대 중 방향키 = 옮기기")))]]
+            // 지도 + 오른쪽 위 확대 배율·전체 보기 버튼
+            +SSplitter::Slot().Value(.53f)[SNew(SOverlay)
+                +SOverlay::Slot()[SAssignNew(Map,SMap,SharedThis(this))]
+                +SOverlay::Slot().HAlign(HAlign_Right).VAlign(VAlign_Top).Padding(6)[SNew(SHorizontalBox).Visibility(EVisibility::SelfHitTestInvisible)
+                    +SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4,0)[SNew(STextBlock).Visibility(EVisibility::HitTestInvisible).ColorAndOpacity(FLinearColor::White).Text_Lambda([](){return FText::FromString(FString::Printf(TEXT("확대 ×%.1f"),MapView.Zoom));})]
+                    +SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(T(TEXT("전체 보기"))).ToolTipText(T(TEXT("지도 전체가 보이게 되돌립니다 (Home 키 · 가운데 버튼 더블클릭)"))).IsEnabled_Lambda([](){return MapView.Zoom>1.0001;})
+                        .OnClicked_Lambda([this](){ResetView();if(Map)Map->Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();})]]]
+            // 오른쪽 칸: 창이 작아도 아래까지 보이게 통째로 스크롤 (목록·세부 정보는 고정 높이로 넣어 스크롤끼리 다투지 않게)
+            +SSplitter::Slot().Value(.32f)[SAssignNew(RightScroll,SScrollBox)+SScrollBox::Slot()[SNew(SVerticalBox)
                 +SVerticalBox::Slot().AutoHeight().Padding(4)[SNew(STextBlock).Text_Lambda([this](){auto* P=GetPlan();if(P&&P->Recipe.Landforms.IsValidIndex(Selected))return FText::FromString(P->Recipe.Landforms[Selected].Name);if(P&&P->Recipe.Routes.IsValidIndex(Route))return FText::FromString(P->Recipe.Routes[Route].Name);return T(TEXT("선택 요소 / 전체 설계"));})]
                 // 종류·가장자리 방식 (평지·산 모두 · 바꿔도 다른 값은 그대로)
                 +SVerticalBox::Slot().AutoHeight()[SNew(SBox).Visibility_Lambda([this](){return Show(Sel()!=nullptr);})[Choice(TEXT("종류"),TEXT("평지"),TEXT("산"),[this](){const auto* F=Sel();return F?(F->Type==ECozyLandform::Mountain?1:0):-1;},[this](int V){Mutate([this,V](ACozyTerrainLayout& P){if(P.Recipe.Landforms.IsValidIndex(Selected))P.Recipe.Landforms[Selected].Type=V?ECozyLandform::Mountain:ECozyLandform::Plateau;});},TEXT("평지: 정한 높이로 평평하게 · 산: 가운데가 가장 높은 언덕·산"))]]
@@ -383,7 +404,8 @@ public:
                     .OnGenerateRow_Lambda([this](TSharedPtr<int32> Item,const TSharedRef<STableViewBase>& Owner){const int32 Id=*Item;return SNew(STableRow<TSharedPtr<int32>>,Owner)[SNew(STextBlock).Text_Lambda([this,Id](){return ItemText(Id);})];})
                     .OnSelectionChanged_Lambda([this](TSharedPtr<int32> Item,ESelectInfo::Type How){if(How==ESelectInfo::Direct||!Item)return;SelectNone();if(*Item>=0)Selected=*Item;else Route=-1-*Item;Mode=0;if(Map)Map->Invalidate(EInvalidateWidgetReason::Paint);})]]
                 +SVerticalBox::Slot().AutoHeight().Padding(4,8,4,2)[SNew(STextBlock).Text(T(TEXT("전체 설계 · 재질 · 설정 이름")))]
-                +SVerticalBox::Slot().FillHeight(1)[Details.ToSharedRef()]]]
+                // 세부 정보 칸 높이: 오른쪽 칸 높이의 60% (최소 300) · 안에서 따로 스크롤
+                +SVerticalBox::Slot().AutoHeight()[SNew(SBox).HeightOverride_Lambda([this]()->FOptionalSize{const float H=RightScroll?float(RightScroll->GetCachedGeometry().GetLocalSize().Y):0.f;return FMath::Max(300.f,H*.6f);})[Details.ToSharedRef()]]]]]
         +SVerticalBox::Slot().AutoHeight().Padding(4)[SNew(SHorizontalBox)
             +SHorizontalBox::Slot().AutoWidth().Padding(2)[Button(TEXT("되돌리기"),[this](){GEditor->UndoTransaction();SelectNone();Refresh();ScheduleLive();})]
             +SHorizontalBox::Slot().AutoWidth().Padding(2)[Button(TEXT("다시 실행"),[this](){GEditor->RedoTransaction();SelectNone();Refresh();ScheduleLive();})]
@@ -415,7 +437,16 @@ public:
 };
 
 // 지도는 실제 지형 비율 그대로 창 가운데에 그린다 (창을 늘리고 줄여도 찌그러지지 않게 · 남는 곳은 빈 여백)
-static void FitMap(const FVector2D& Size,const FVector2D& Span,FVector2D& Origin,FVector2D& Drawn){const double S=FMath::Min(Size.X/FMath::Max(1.,Span.X),Size.Y/FMath::Max(1.,Span.Y));Drawn=Span*S;Origin=(Size-Drawn)*.5;}
+// 확대하면 1m당 픽셀이 Zoom배 · 지도 가장자리가 화면 안쪽으로 들어오지 않게 가운데 위치를 묶음 (전체 보기에서는 항상 가운데)
+static double MapScale(const FVector2D& Size,const FVector2D& Span){return FMath::Min(Size.X/FMath::Max(1.,Span.X),Size.Y/FMath::Max(1.,Span.Y))*MapView.Zoom;}
+static FVector2D ClampedCenter(const FVector2D& Size,const FVector2D& Span,double S)
+{
+    const double RX=FMath::Max(0.,Span.X*.5-Size.X*.5/FMath::Max(S,1e-6)),RY=FMath::Max(0.,Span.Y*.5-Size.Y*.5/FMath::Max(S,1e-6));
+    return FVector2D(FMath::Clamp(MapView.Center.X,-RX,RX),FMath::Clamp(MapView.Center.Y,-RY,RY));
+}
+static void ClampView(const FVector2D& Size,const FVector2D& Span){if(MapView.Zoom<=1.0001){ResetView();return;}MapView.Center=ClampedCenter(Size,Span,MapScale(Size,Span));}
+// Origin·Drawn = 지도 전체(MapSize)가 그려지는 픽셀 범위 (확대하면 창보다 커지고 바깥은 잘림)
+static void FitMap(const FVector2D& Size,const FVector2D& Span,FVector2D& Origin,FVector2D& Drawn){const double S=MapScale(Size,Span);Drawn=Span*S;const FVector2D C=ClampedCenter(Size,Span,S);Origin=(Size-Drawn)*.5+FVector2D(-C.X*S,C.Y*S);}
 static FVector2D ToMap(FVector2D P,const FVector2D& Size,const FVector2D& Span){FVector2D O,D;FitMap(Size,Span,O,D);return O+FVector2D((P.X/Span.X+.5)*D.X,(.5-P.Y/Span.Y)*D.Y);}
 static FVector2D FromMap(FVector2D P,const FVector2D& Size,const FVector2D& Span){FVector2D O,D;FitMap(Size,Span,O,D);P-=O;return FVector2D((P.X/D.X-.5)*Span.X,(.5-P.Y/D.Y)*Span.Y);}
 // 지도 1픽셀이 몇 m인지 (점 끼워 넣기 거리 판정용)
@@ -479,21 +510,26 @@ int32 SMap::OnPaint(const FPaintArgs&,const FGeometry& G,const FSlateRect&,FSlat
     FSlateDrawElement::MakeBox(Out,L,G.ToPaintGeometry(),Brush,ESlateDrawEffect::None,FLinearColor(.025,.04,.05));
     if(!P){FSlateDrawElement::MakeText(Out,L+1,G.ToPaintGeometry(),TEXT("새 설계 또는 선택 Landscape 연결로 시작"),FAppStyle::GetFontStyle("NormalFont"),ESlateDrawEffect::None,FLinearColor::White);return L+1;}
     FVector2D MO,MD;FitMap(Size,P->Recipe.MapSize,MO,MD);
+    // 바탕 48칸은 지도 중 화면에 보이는 부분에만 (전체 보기에서는 지도 전체 = 예전과 같음 · 확대하면 더 촘촘)
+    const FVector2D VA(FMath::Max(MO.X,0.),FMath::Max(MO.Y,0.)),VB(FMath::Min(MO.X+MD.X,Size.X),FMath::Min(MO.Y+MD.Y,Size.Y)),VD(FMath::Max(VB.X-VA.X,1.),FMath::Max(VB.Y-VA.Y,1.));
+    const double PM=PixelMeters(Size,P->Recipe.MapSize);
     constexpr int N=48;float Heights[N+1][N+1];float Low=FLT_MAX,High=-FLT_MAX;
-    for(int Y=0;Y<=N;++Y)for(int X=0;X<=N;++X){float Z=P->Sample(FromMap(MO+FVector2D(double(X)/N*MD.X,double(Y)/N*MD.Y),Size,P->Recipe.MapSize));Heights[Y][X]=Z;Low=FMath::Min(Low,Z);High=FMath::Max(High,Z);}
+    for(int Y=0;Y<=N;++Y)for(int X=0;X<=N;++X){float Z=P->Sample(FromMap(VA+FVector2D(double(X)/N*VD.X,double(Y)/N*VD.Y),Size,P->Recipe.MapSize));Heights[Y][X]=Z;Low=FMath::Min(Low,Z);High=FMath::Max(High,Z);}
+    // 확대 중에도 색(낮음~높음)은 지도 전체 기준으로 (16칸 대충 훑기)
+    if(MapView.Zoom>1.0001)for(int Y=0;Y<=16;++Y)for(int X=0;X<=16;++X){const float Z=P->Sample(FVector2D((X/16.-.5)*P->Recipe.MapSize.X,(Y/16.-.5)*P->Recipe.MapSize.Y));Low=FMath::Min(Low,Z);High=FMath::Max(High,Z);}
     auto Line=[&](FVector2D A,FVector2D B,FLinearColor C,float Width=1.f){TArray<FVector2D> V={A,B};FSlateDrawElement::MakeLines(Out,L+2,G.ToPaintGeometry(),V,ESlateDrawEffect::None,C,true,Width);};
     for(int Y=0;Y<N;++Y)for(int X=0;X<N;++X)
     {
         const float Z=Heights[Y][X],T=(Z-Low)/FMath::Max(1.f,High-Low);
         FLinearColor C=FMath::Lerp(FLinearColor(.04,.25,.25),FLinearColor(.88,.65,.25),T);
-        const float DX=(Heights[Y][X+1]-Z)/(P->Recipe.MapSize.X/N),DY=(Heights[Y+1][X]-Z)/(P->Recipe.MapSize.Y/N);
+        const float DX=(Heights[Y][X+1]-Z)/float(VD.X/N*PM),DY=(Heights[Y+1][X]-Z)/float(VD.Y/N*PM);
         if(Owner->bSlope&&FMath::RadiansToDegrees(FMath::Atan(FMath::Sqrt(DX*DX+DY*DY)))>P->SlopeLimit)C=FLinearColor(.75,.12,.07);
-        const FVector2D A=MO+FVector2D(double(X)/N*MD.X,double(Y)/N*MD.Y),Cell(MD.X/N+1,MD.Y/N+1);
+        const FVector2D A=VA+FVector2D(double(X)/N*VD.X,double(Y)/N*VD.Y),Cell(VD.X/N+1,VD.Y/N+1);
         FSlateDrawElement::MakeBox(Out,L+1,G.ToPaintGeometry(FVector2f(Cell),FSlateLayoutTransform(FVector2f(A))),Brush,ESlateDrawEffect::None,C);
         if(Owner->bContours)
         {
             // 정사각 셀 변의 등고선 교점을 선형 보간한다.
-            const FVector2D Corners[]={A,A+FVector2D(MD.X/N,0),A+FVector2D(MD.X/N,MD.Y/N),A+FVector2D(0,MD.Y/N)};
+            const FVector2D Corners[]={A,A+FVector2D(VD.X/N,0),A+FVector2D(VD.X/N,VD.Y/N),A+FVector2D(0,VD.Y/N)};
             const float Values[]={Z,Heights[Y][X+1],Heights[Y+1][X+1],Heights[Y+1][X]};
             float Min=Z,Max=Z;for(float V:Values){Min=FMath::Min(Min,V);Max=FMath::Max(Max,V);}
             const float Gap=FMath::Max(.5f,P->ContourInterval);
@@ -579,6 +615,12 @@ FReply SMap::OnMouseButtonDown(const FGeometry& G,const FPointerEvent& E)
 {
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;if(!P||GEditor->PlayWorld)return FReply::Unhandled();
     const FVector2D Size=G.GetLocalSize(),Mouse=G.AbsoluteToLocal(E.GetScreenSpacePosition()),Pos=FromMap(Mouse,Size,P->Recipe.MapSize);
+    // 지도 옮기기 시작: 가운데 버튼 · Space 누른 채 왼쪽 (다른 끌기 중이면 무시)
+    if(E.GetEffectingButton()==EKeys::MiddleMouseButton||(E.GetEffectingButton()==EKeys::LeftMouseButton&&bSpace))
+    {
+        if(HasMouseCapture())return FReply::Handled();
+        bPan=true;PanButton=E.GetEffectingButton();PanLast=Mouse;return FReply::Handled().CaptureMouse(SharedThis(this)).SetUserFocus(SharedThis(this));
+    }
     // 고른 자유 모양의 점을 오른쪽 클릭 → 뾰족하게/둥글게 전환
     if(E.GetEffectingButton()==EKeys::RightMouseButton)
     {
@@ -663,6 +705,7 @@ FReply SMap::OnMouseButtonDown(const FGeometry& G,const FPointerEvent& E)
 FReply SMap::OnMouseMove(const FGeometry& G,const FPointerEvent& E)
 {
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;
+    if(bPan){const FVector2D M=G.AbsoluteToLocal(E.GetScreenSpacePosition());if(P)PanPixels(G.GetLocalSize(),P->Recipe.MapSize,M-PanLast);PanLast=M;if(bHover)HoverPixel=M;return FReply::Handled();}
     // 자유 모양 그리는 중: 마우스까지 미리보기 선
     if(O&&P&&O->IsDrawing()){HoverPixel=G.AbsoluteToLocal(E.GetScreenSpacePosition());bHover=true;if(DrawPts.Num())Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();}
     if(!Drag||!P||!HasMouseCapture())return FReply::Unhandled();
@@ -688,6 +731,7 @@ FReply SMap::OnMouseMove(const FGeometry& G,const FPointerEvent& E)
 }
 FReply SMap::OnMouseButtonUp(const FGeometry& G,const FPointerEvent& E)
 {
+    if(bPan&&E.GetEffectingButton()==PanButton){bPan=false;return FReply::Handled().ReleaseMouseCapture();}
     if(E.GetEffectingButton()!=EKeys::LeftMouseButton)return FReply::Unhandled();
     if(auto O=Panel.Pin())if(auto* P=O->GetPlan())
     {
@@ -710,6 +754,9 @@ FReply SMap::OnMouseButtonUp(const FGeometry& G,const FPointerEvent& E)
 }
 FReply SMap::OnMouseButtonDoubleClick(const FGeometry& G,const FPointerEvent& E)
 {
+    // 가운데 버튼 더블클릭 = 전체 보기 · Space 누른 채면 옮기기로
+    if(E.GetEffectingButton()==EKeys::MiddleMouseButton){bPan=false;ResetView();Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled().ReleaseMouseCapture();}
+    if(bSpace&&E.GetEffectingButton()==EKeys::LeftMouseButton)return OnMouseButtonDown(G,E);
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;if(!P||E.GetEffectingButton()!=EKeys::LeftMouseButton||GEditor->PlayWorld)return FReply::Unhandled();
     const FVector2D Size=G.GetLocalSize(),Mouse=G.AbsoluteToLocal(E.GetScreenSpacePosition()),Pos=FromMap(Mouse,Size,P->Recipe.MapSize);
     // 그리는 중 더블클릭 = 닫기 (첫 번째 클릭에서 이미 점이 찍힘)
@@ -734,10 +781,40 @@ FReply SMap::OnMouseButtonDoubleClick(const FGeometry& G,const FPointerEvent& E)
     }
     return OnMouseButtonDown(G,E);
 }
-void SMap::OnMouseCaptureLost(const FCaptureLostEvent&){bCreating=bPointDrag=false;Drag.Reset();}
-FReply SMap::OnKeyDown(const FGeometry&,const FKeyEvent& E)
+void SMap::OnMouseCaptureLost(const FCaptureLostEvent&){bCreating=bPointDrag=bPan=false;Drag.Reset();}
+void SMap::PanPixels(const FVector2D& Size,const FVector2D& Span,FVector2D Delta)
+{
+    if(MapView.Zoom<=1.0001)return;
+    // 끈 방향으로 지도가 따라옴 (화면 아래 = 지도 -Y)
+    const double S=MapScale(Size,Span);MapView.Center=ClampedCenter(Size,Span,S)+FVector2D(-Delta.X/S,Delta.Y/S);ClampView(Size,Span);
+    Invalidate(EInvalidateWidgetReason::Paint);
+}
+FReply SMap::OnMouseWheel(const FGeometry& G,const FPointerEvent& E)
 {
     const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;if(!P)return FReply::Unhandled();
+    const FVector2D Size=G.GetLocalSize(),Span=P->Recipe.MapSize,Mouse=G.AbsoluteToLocal(E.GetScreenSpacePosition());
+    // 마우스 아래 지점이 그대로 있게 확대·축소 (한 칸에 1.2배 · 1~12배)
+    const FVector2D W=FromMap(Mouse,Size,Span);
+    MapView.Zoom=FMath::Clamp(MapView.Zoom*FMath::Pow(1.2,double(E.GetWheelDelta())),1.,12.);
+    if(MapView.Zoom<=1.0001)ResetView();
+    else{const double S=MapScale(Size,Span);MapView.Center=FVector2D(W.X-(Mouse.X-Size.X*.5)/S,W.Y+(Mouse.Y-Size.Y*.5)/S);ClampView(Size,Span);}
+    if(bHover)HoverPixel=Mouse;
+    Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();
+}
+FReply SMap::OnKeyDown(const FGeometry& G,const FKeyEvent& E)
+{
+    const auto O=Panel.Pin();auto* P=O?O->GetPlan():nullptr;if(!P)return FReply::Unhandled();
+    // 보기: Home 전체 보기 · Space 누른 채 끌기 · 확대 중 방향키로 옮기기
+    if(E.GetKey()==EKeys::Home){ResetView();Invalidate(EInvalidateWidgetReason::Paint);return FReply::Handled();}
+    if(E.GetKey()==EKeys::SpaceBar){bSpace=true;return FReply::Handled();}
+    if(MapView.Zoom>1.0001)
+    {
+        const FVector2D Size=G.GetLocalSize(),Step=Size*.15;
+        if(E.GetKey()==EKeys::Left){PanPixels(Size,P->Recipe.MapSize,FVector2D(Step.X,0));return FReply::Handled();}
+        if(E.GetKey()==EKeys::Right){PanPixels(Size,P->Recipe.MapSize,FVector2D(-Step.X,0));return FReply::Handled();}
+        if(E.GetKey()==EKeys::Up){PanPixels(Size,P->Recipe.MapSize,FVector2D(0,Step.Y));return FReply::Handled();}
+        if(E.GetKey()==EKeys::Down){PanPixels(Size,P->Recipe.MapSize,FVector2D(0,-Step.Y));return FReply::Handled();}
+    }
     if(O->IsDrawing())
     {
         // 자유 모양 그리는 중: Enter 닫기 · Backspace 마지막 점 지우기 · Esc 취소
