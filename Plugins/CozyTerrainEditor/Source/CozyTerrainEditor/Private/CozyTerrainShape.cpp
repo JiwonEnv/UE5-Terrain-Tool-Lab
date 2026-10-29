@@ -158,3 +158,179 @@ namespace CozyTerrainShape
         return Avg+FVector2D(Cx/(3.0*A2),Cy/(3.0*A2));
     }
 }
+
+// ---- 랜덤 (작업 3) ----
+namespace CozyTerrainShapeRandomImpl
+{
+    // 정수 섞기(씨앗 → 겹마다 다른 출발점)
+    FORCEINLINE uint32 Hash32(uint32 X){ X^=X>>16; X*=0x7feb352dU; X^=X>>15; X*=0x846ca68bU; X^=X>>16; return X; }
+    // 펄린 잡음은 256칸마다 반복 → 미리 0..256으로 접어 float 정밀도 손실을 막는다
+    FORCEINLINE double Wrap256(double V){ return V-256.0*FMath::FloorToDouble(V/256.0); }
+
+    // 닫힌 꺾은선을 둘레 길이 기준 M개 고른 점으로
+    void ResampleClosed(const TArray<FVector2D>& Poly,int32 M,TArray<FVector2D>& Res)
+    {
+        Res.Reset(); const int32 N=Poly.Num(); if(N<2||M<1) return;
+        double L=0; for(int32 i=0;i<N;++i) L+=FVector2D::Distance(Poly[i],Poly[(i+1)%N]);
+        if(L<=0){ Res.Add(Poly[0]); return; }
+        int32 Seg=0; double SegStart=0, SegLen=FVector2D::Distance(Poly[0],Poly[1%N]);
+        for(int32 m=0;m<M;++m)
+        {
+            const double S=L*m/M;
+            while(Seg<N-1&&SegStart+SegLen<S){ SegStart+=SegLen; ++Seg; SegLen=FVector2D::Distance(Poly[Seg],Poly[(Seg+1)%N]); }
+            const double T=SegLen>0?FMath::Clamp((S-SegStart)/SegLen,0.0,1.0):0.0;
+            const FVector2D A=Poly[Seg], B=Poly[(Seg+1)%N];
+            Res.Add(A+(B-A)*T);
+        }
+    }
+}
+
+namespace CozyTerrainShape
+{
+    namespace RImpl=CozyTerrainShapeRandomImpl;
+
+    float Noise2D(FVector2D P, float Size, int32 Seed)
+    {
+        // 4겹 펄린(겹마다 크기 ½ · 세기 ½) · 겹마다 씨앗으로 정한 다른 출발점
+        const double Inv=1.0/FMath::Max(double(Size),0.5);
+        double X=P.X*Inv, Y=P.Y*Inv, Amp=1, Sum=0, Norm=0;
+        for(int32 o=0;o<4;++o)
+        {
+            const uint32 H=RImpl::Hash32(uint32(Seed)*0x9E3779B9u+uint32(o)*0x85EBCA6Bu+0x632BE5ABu);
+            const double Ox=double(H&0xFFFFu)*(256.0/65536.0), Oy=double(H>>16)*(256.0/65536.0);
+            Sum+=Amp*double(FMath::PerlinNoise2D(FVector2D(RImpl::Wrap256(X+Ox),RImpl::Wrap256(Y+Oy))));
+            Norm+=Amp; Amp*=0.5; X*=2.0; Y*=2.0;
+        }
+        // 겹을 합치면 값이 가운데로 몰리므로 키워서 대략 -1~1로 맞춘다
+        return float(FMath::Clamp(Sum/Norm*1.6,-1.2,1.2));
+    }
+
+    void ApplyEdgeJitter(FCozyPolyShape& Shape, float Amount, float Size, int32 Seed)
+    {
+        if(Amount<=0||!Shape.IsValid()) return;
+        const double Sz=FMath::Max(double(Size),0.5);
+        const double MaxSeg=FMath::Max(Sz/6.0,0.5);
+        const int32 N=Shape.Poly.Num();
+
+        // 1) 다시 나누기 · 끼운 점은 출발 꼭짓점의 구간 번호를 이어받음
+        TArray<FVector2D> P; TArray<int32> S; P.Reserve(N*2); S.Reserve(N*2);
+        for(int32 i=0;i<N;++i)
+        {
+            const FVector2D A=Shape.Poly[i], B=Shape.Poly[(i+1)%N];
+            const int32 Sp=Shape.Span.IsValidIndex(i)?Shape.Span[i]:i;
+            const int32 Cuts=FMath::Clamp(FMath::CeilToInt32(FVector2D::Distance(A,B)/MaxSeg),1,4096);
+            P.Add(A); S.Add(Sp);
+            for(int32 c=1;c<Cuts;++c){ P.Add(A+(B-A)*(double(c)/Cuts)); S.Add(Sp); }
+        }
+        const int32 M=P.Num();
+
+        // 2) 둘레 길이 · 방향(넓이 부호)
+        TArray<double> Arc; Arc.SetNumUninitialized(M);
+        double L=0, A2=0;
+        for(int32 i=0;i<M;++i)
+        {
+            Arc[i]=L; const FVector2D& A=P[i]; const FVector2D& B=P[(i+1)%M];
+            L+=FVector2D::Distance(A,B); A2+=A.X*B.Y-B.X*A.Y;
+        }
+        if(L<=0) return;
+        const double Out=A2>=0?1.0:-1.0; // 반시계면 진행 방향의 오른쪽이 바깥
+
+        // 3) 꼭짓점 바깥 방향 = 양쪽 선분 바깥 방향의 평균
+        auto EdgeNormal=[&](const FVector2D& A,const FVector2D& B){ const FVector2D D=(B-A).GetSafeNormal(); return FVector2D(D.Y,-D.X)*Out; };
+        TArray<FVector2D> R; R.SetNumUninitialized(M);
+        const double TwoPi=2.0*UE_DOUBLE_PI, Rad=L/(TwoPi*Sz);
+        for(int32 i=0;i<M;++i)
+        {
+            const FVector2D& Pv=P[(i-1+M)%M]; const FVector2D& Pc=P[i]; const FVector2D& Pn=P[(i+1)%M];
+            FVector2D Nrm=(EdgeNormal(Pv,Pc)+EdgeNormal(Pc,Pn)).GetSafeNormal();
+            if(Nrm.IsNearlyZero()) Nrm=EdgeNormal(Pc,Pn);
+            // 둘레를 원으로 감아 잡음을 읽는다 → 끝과 처음이 이어짐 · 원 둘레 = L/Size 덩어리
+            const double Th=TwoPi*Arc[i]/L;
+            const double Nz=FMath::Clamp(double(Noise2D(FVector2D(FMath::Cos(Th),FMath::Sin(Th))*Rad,1.f,Seed)),-1.0,1.0);
+            R[i]=Pc+Nrm*(double(Amount)*Nz);
+        }
+        Shape.Poly=MoveTemp(R); Shape.Span=MoveTemp(S);
+    }
+
+    void GenerateBands(const TArray<FCozyShapePoint>& Outline, int32 Count, float PeakHeight, int32 Seed, TArray<FCozyContourBand>& OutBands)
+    {
+        OutBands.Reset();
+        if(Outline.Num()<3) return;
+        const int32 K=FMath::Clamp(Count,1,8);
+        constexpr int32 Sub=8, NumPts=16;
+        FCozyPolyShape Outer; BuildPolyline(Outline,Sub,Outer); Prepare(Outer);
+        if(!Outer.IsValid()||Outer.MaxInset<=0) return;
+        FRandomStream Rng(Seed);
+
+        // 1) 꼭대기 C: 범위 안 후보 40개(못 찾으면 더) 중 '무작위 + 깊이(가장 깊은 곳의 35% 이상이면 만점)' 점수가 가장 높은 곳
+        const double Deep=0.35*Outer.MaxInset;
+        FVector2D C=FVector2D::ZeroVector; double BestScore=-1;
+        for(int32 Try=0;Try<400&&(Try<40||BestScore<0);++Try)
+        {
+            const FVector2D P(Rng.FRandRange(Outer.Bounds.Min.X,Outer.Bounds.Max.X),Rng.FRandRange(Outer.Bounds.Min.Y,Outer.Bounds.Max.Y));
+            const double Luck=Rng.FRand();
+            const double D=-double(SignedDistance(Outer,P));
+            if(D<=0) continue;
+            const double Score=Luck+2.0*FMath::Min(D/Deep,1.0);
+            if(Score>BestScore){ BestScore=Score; C=P; }
+        }
+        if(BestScore<0) return;
+
+        // 2) 바깥 모양을 고른 간격 32점으로 → C에서 곧게 보이는(선분이 넉넉히 안쪽으로만 지나는) 점만 남겨 최대 16점
+        //    오목한 모양에서 C 쪽으로 줄일 때 테두리 밖으로 나가거나 오목한 모서리에 끼지 않게 하기 위함
+        TArray<FVector2D> All; RImpl::ResampleClosed(Outer.Poly,2*NumPts,All);
+        TArray<FVector2D> Seen;
+        for(const FVector2D& Oi:All)
+        {
+            const double Dist=FVector2D::Distance(Oi,C); bool bSee=true;
+            for(int32 s=1;bSee&&s<=12;++s)
+            {
+                const double T=s/12.0;
+                bSee=SignedDistance(Outer,Oi+(C-Oi)*T)<=-FMath::Min(0.3*Outer.MaxInset,0.5*T*Dist);
+            }
+            if(bSee) Seen.Add(Oi);
+        }
+        if(Seen.Num()<3) Seen=All;
+        TArray<FVector2D> O;
+        if(Seen.Num()>NumPts){ for(int32 i=0;i<NumPts;++i) O.Add(Seen[(i*Seen.Num())/NumPts]); }
+        else O=MoveTemp(Seen);
+        if(O.Num()<3) return;
+        const double Margin=FMath::Max(0.01*Outer.MaxInset,0.02);
+        FCozyPolyShape Prev=Outer;
+        for(int32 k=1;k<=K;++k)
+        {
+            const double F=double(k)/(K+1);
+            TArray<FVector2D> Pts; Pts.Reserve(O.Num());
+            for(const FVector2D& Oi:O)
+            {
+                const FVector2D Dir=(Oi-C)*(1.0-F); // C에서 이 띠 점까지 (지역 반지름)
+                const double Wob=Rng.FRandRange(-1.0,1.0)*0.08*(1.0-0.5*F);
+                FVector2D P=C+Dir*(1.0+Wob);
+                // 앞 띠(처음은 바깥 모양) 안쪽에 들 때까지 C 쪽으로 당김
+                for(int32 It=0;It<24&&SignedDistance(Prev,P)>-Margin;++It) P+=(C-P)*0.25;
+                Pts.Add(P);
+            }
+            // 곡선으로 이었을 때 앞 띠를 벗어나는 구간이 있으면 그 구간 양 끝 점을 더 당긴다 · 여러 번 안 되면 띠 전체를 C 쪽으로 줄임
+            FCozyContourBand Band; Band.Height=PeakHeight*float(k)/float(K+1);
+            FCozyPolyShape Shape;
+            for(int32 Round=0;Round<16;++Round)
+            {
+                Band.Points.Reset();
+                for(const FVector2D& P:Pts){ FCozyShapePoint X; X.Position=P; X.bSharp=false; Band.Points.Add(X); }
+                BuildPolyline(Band.Points,Sub,Shape);
+                TArray<bool> Bad; Bad.Init(false,Pts.Num()); bool bAny=false;
+                for(int32 j=0;j<Shape.Poly.Num();++j)
+                {
+                    if(SignedDistance(Prev,Shape.Poly[j])<=-Margin*0.5) continue;
+                    const int32 Sp=Shape.Span.IsValidIndex(j)?Shape.Span[j]:0;
+                    if(Pts.IsValidIndex(Sp)){ Bad[Sp]=true; Bad[(Sp+1)%Pts.Num()]=true; bAny=true; }
+                }
+                if(!bAny) break;
+                if(Round>=6) Bad.Init(true,Pts.Num());
+                for(int32 i=0;i<Pts.Num();++i) if(Bad[i]) Pts[i]+=(C-Pts[i])*0.2;
+            }
+            OutBands.Add(Band);
+            Prev=MoveTemp(Shape);
+        }
+    }
+}
